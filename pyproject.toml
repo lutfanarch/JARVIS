@@ -1,0 +1,60 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "jarvis"
+version = "0.1.0"
+description = "AI-assisted trading data informer"
+authors = [
+    { name = "Your Name", email = "your.email@example.com" },
+]
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "pandas>=1.5,<3.0",
+    "numpy>=1.23,<2.0",
+    "requests>=2.28,<3.0",
+    "pydantic>=2.0,<3.0",
+    "click>=8.0,<9.0",
+    "sqlalchemy>=2.0,<3.0",
+    "psycopg2-binary>=2.9,<3.0",
+    "mplfinance==0.12.10b0",
+    "alembic>=1.8,<2.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    # Allow pytest 8.x to avoid installation blocks while keeping
+    # compatibility with future releases.  Pin only the lower bound.
+    "pytest>=7.0,<9.0",
+    "black>=23.0",
+    "isort>=5.0",
+    "flake8>=6.0",
+    "pre-commit>=3.0",
+]
+
+# Optional extras for TA-Lib pattern recognition
+talib = [
+    "TA-Lib==0.5.3"
+]
+
+[project.scripts]
+# Console entrypoints allowing ``jarvis`` and ``informer`` to invoke the CLI
+jarvis = "informer.cli:cli"
+informer = "informer.cli:cli"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["informer*"]
+
+[tool.setuptools.package-dir]
+"" = "src"
+
+# Pytest configuration: define custom markers.  The integration marker
+# identifies tests that require external services such as live
+# databases or network calls and may be skipped in offline runs.
+[tool.pytest.ini_options]
+markers = [
+    "integration: tests requiring external services (db/network)",
+]
