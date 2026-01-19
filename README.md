@@ -9,7 +9,8 @@ Pydantic for type-safe models.
 
 ## Quickstart (Local, Windows-friendly)
 
-JARVIS runs end‑to‑end without Docker.  The following steps walk through a typical setup on Windows or any local machine:
+JARVIS runs end‑to‑end locally without requiring any container runtime.
+The following steps walk through a typical setup on Windows or any local machine:
 
 1. **Install dependencies** – create a Python 3.11 virtual environment and install JARVIS in editable mode with development extras:
 
@@ -62,6 +63,22 @@ network calls and can be used at any time to sanity‑check your setup.
   either `GEMINI_API_KEY` or `GOOGLE_API_KEY`.  If any are missing the
   command exits with a non‑zero status and lists the missing variable names.
 
+When running the full daily scan in live mode (`jarvis daily-scan --run-mode live`)
+without the required API keys, JARVIS performs the same preflight validation as
+`config-check --mode live`.  If any of the mandatory variables are missing
+the pipeline is skipped deterministically: a `NOT_READY` decision and a
+corresponding run record are still written under `artifacts/`, a concise
+message lists the missing variable names in sorted order, and the process
+exits with code 2.  This fail‑closed behaviour ensures that no provider
+initialisation or network calls occur when credentials are absent.
+
+  Similarly, the `jarvis decide` command enforces a live‑mode preflight when
+  `LLM_MODE=live` is set.  If any of the required keys are missing, the
+  decision pipeline is skipped entirely.  A `NOT_READY` decision file is
+  created under `artifacts/decisions/<run_id>.json`, the missing variables are
+  listed and the command exits with code 2.  This prevents false
+  `NO_TRADE` decisions due to misconfigured live environments.
+
 
 For development sanity checking, ensure your local sources are used by setting `PYTHONPATH=src` when running commands directly from the repository.
 
@@ -95,6 +112,26 @@ Use the `jarvis notify --decision-file artifacts/decisions/<run_id>.json`
 command to dispatch a trade alert.  No message is sent for
 NO_TRADE decisions.
 
+## Prop firm evaluation profiles
+
+JARVIS can be configured to apply additional risk and validity gates
+derived from proprietary trading firm evaluation programs.  When the
+environment variable ``PROP_PROFILE`` is set to a supported profile
+name, the validator constrains per‑trade risk, enforces a minimum
+profit per share and optionally caps the total profit on a position.
+Trades violating these rules are vetoed into a ``NO_TRADE`` decision
+with a ``PROP_RULE_VIOLATION`` reason code.  Passing trades include a
+``prop`` block in the decision summarising the active profile and
+budgets.  See ``docs/propfirms.md`` for details and a list of
+supported profiles.
+
+To monitor your progress through an evaluation, use the operator‐
+facing command ``jarvis prop eval-status``.  This command reads the
+forward‐test registry and realised outcomes, aggregates your profit
+toward the target and warns when concentration, drawdown or daily
+loss limits are at risk of being breached.  Detailed usage and
+metrics are documented in ``docs/propfirms.md``.
+
 ## Phase 3: 24/7 Automation and Scheduling
 
 For unattended operation JARVIS no longer relies on a shell script.  It
@@ -113,30 +150,9 @@ To run the scan automatically at a fixed time on weekdays, use
 environment variable (default `America/New_York`) and sleeps until
 then before invoking `jarvis daily-scan`.  It loops indefinitely by
 default; supply `--once` to run a single cycle or `--dry-run` to
-print the next scheduled run without sleeping or executing the scan.  A
-similar Docker‑based scheduler service remains available in
-`deploy/docker/` for containerised deployments, but local usage never
-requires Docker.
+print the next scheduled run without sleeping or executing the scan.
 
-## Deploy with Docker (optional)
 
-Docker deployment is optional and primarily intended for production or
-server environments.  The Dockerfile and compose configuration live under
-`deploy/docker/` to keep them separate from the local development flow.
-When running inside Docker a TimescaleDB container and a lightweight
-scheduler service are provisioned alongside JARVIS.  The scheduler
-triggers the daily scan according to the cron‑style schedule defined by
-the `JARVIS_SCAN_CRON` and `JARVIS_SCAN_TZ` environment variables
-(defaults: 10:15 AM New York time on weekdays).  Adjust these variables
-to suit your market timings.  To stand up the stack run:
-
-```sh
-cd deploy/docker
-docker compose up -d
-```
-
-Logs can be obtained via `docker compose logs`.  Local operation never
-requires Docker.
 
 ## Typical Phase 1 Daily Flow
 

@@ -143,19 +143,22 @@ def test_cli_backtest_sweep_runs_and_writes_artifacts(tmp_path, monkeypatch):
     # Setup temporary database
     db_url = _setup_database(tmp_path)
     monkeypatch.setenv("DATABASE_URL", db_url)
-    # Insert synthetic bars for three consecutive days
+    # Insert synthetic bars for multiple trading days (>=10) to satisfy warmup
     engine = create_engine(db_url)
-    # Three weekdays starting from 2025‑01‑02
     start_day = date(2025, 1, 2)
-    for day_offset in range(3):
-        d = start_day + timedelta(days=day_offset)
-        # Skip weekends (if any) by checking weekday (0=Mon, 6=Sun)
-        if d.weekday() >= 5:
-            continue
-        prices = [100 + i * 0.1 for i in range(26)]
-        bars = _make_bars_for_day(d, prices)
-        with engine.begin() as conn:
-            conn.execute(_bars_table.insert(), bars)
+    days_inserted = 0
+    cur_day = start_day
+    while days_inserted < 10:
+        # Insert bars only on weekdays (0=Monday, 6=Sunday)
+        if cur_day.weekday() < 5:
+            prices = [100 + i * 0.1 for i in range(26)]
+            bars = _make_bars_for_day(cur_day, prices)
+            with engine.begin() as conn:
+                conn.execute(_bars_table.insert(), bars)
+            days_inserted += 1
+        cur_day = cur_day + timedelta(days=1)
+    # Determine the last inserted day (cur_day is now one day after last insertion)
+    end_day = cur_day - timedelta(days=1)
     engine.dispose()
     # Prepare output directory
     out_dir = tmp_path / "sweep_out"
@@ -165,9 +168,9 @@ def test_cli_backtest_sweep_runs_and_writes_artifacts(tmp_path, monkeypatch):
         [
             "backtest-sweep",
             "--start",
-            "2025-01-02",
+            start_day.isoformat(),
             "--end",
-            "2025-01-04",
+            end_day.isoformat(),
             "--symbols",
             "AAPL",
             "--decision-time",
@@ -219,6 +222,15 @@ def test_cli_backtest_sweep_runs_and_writes_artifacts(tmp_path, monkeypatch):
         "profit_factor",
     ]:
         assert key in metrics, f"Metric '{key}' missing from summary"
+
+    # Verify that cost_model assumptions are persisted in best_params.json
+    # Default CLI arguments apply 2.0 basis points slippage and 0.0 commission.
+    with best_params.open() as f:
+        bp_data = json.load(f)
+    assert "cost_model" in bp_data, "cost_model missing from best_params.json"
+    cm = bp_data["cost_model"]
+    assert cm.get("slippage_bps") == 2.0, "Default slippage_bps should be 2.0"
+    assert cm.get("commission_per_share") == 0.0, "Default commission_per_share should be 0.0"
 
 
 def test_cli_backtest_walkforward_runs_and_writes_artifacts(tmp_path, monkeypatch):
@@ -324,6 +336,22 @@ def test_cli_backtest_walkforward_runs_and_writes_artifacts(tmp_path, monkeypatc
     # Ensure regime_breakdown contains expected sections
     rb = oos_summary.get("regime_breakdown", {})
     assert "trend_regime_1h" in rb and "vol_regime_15m" in rb and "combined" in rb
+    # Validate meta block contains cost model and version information
+    assert "meta" in oos_summary, "meta block missing from oos_summary"
+    meta = oos_summary["meta"]
+    assert meta.get("universe_version") is not None, "universe_version missing in meta"
+    assert meta.get("validation_version") is not None, "validation_version missing in meta"
+    # Cost model values should match CLI defaults
+    cm = meta.get("cost_model")
+    assert cm is not None, "cost_model missing in meta"
+    assert cm.get("slippage_bps") == 2.0, "Default slippage_bps should be 2.0 in meta"
+    assert cm.get("commission_per_share") == 0.0, "Default commission_per_share should be 0.0 in meta"
+    # Verify per_symbol exists in oos_summary and contains the trade count for AAPL
+    assert "per_symbol" in oos_summary, "per_symbol missing from oos_summary"
+    per_symbol = oos_summary["per_symbol"]
+    # Since synthetic data uses only AAPL, ensure AAPL metrics include the 'trades' field
+    if "AAPL" in per_symbol:
+        assert isinstance(per_symbol["AAPL"].get("trades"), (int, float)), "per_symbol[AAPL]['trades'] should be numeric"
     # Load and inspect holdout summary JSON
     with holdout_summary_json.open() as f:
         holdout_summary = json.load(f)
@@ -338,6 +366,21 @@ def test_cli_backtest_walkforward_runs_and_writes_artifacts(tmp_path, monkeypatc
         assert key in holdout_summary, f"Key '{key}' missing from holdout_summary"
     rb_h = holdout_summary.get("regime_breakdown", {})
     assert "trend_regime_1h" in rb_h and "vol_regime_15m" in rb_h and "combined" in rb_h
+    # Validate meta block in holdout summary
+    assert "meta" in holdout_summary, "meta block missing from holdout_summary"
+    meta_h = holdout_summary["meta"]
+    assert meta_h.get("universe_version") is not None, "universe_version missing in holdout meta"
+    assert meta_h.get("validation_version") is not None, "validation_version missing in holdout meta"
+    cm_h = meta_h.get("cost_model")
+    assert cm_h is not None, "cost_model missing in holdout meta"
+    assert cm_h.get("slippage_bps") == 2.0, "Default slippage_bps should be 2.0 in holdout meta"
+    assert cm_h.get("commission_per_share") == 0.0, "Default commission_per_share should be 0.0 in holdout meta"
+
+    # Verify per_symbol exists in holdout_summary and contains the trade count for AAPL if present
+    assert "per_symbol" in holdout_summary, "per_symbol missing from holdout_summary"
+    per_symbol_h = holdout_summary["per_symbol"]
+    if "AAPL" in per_symbol_h:
+        assert isinstance(per_symbol_h["AAPL"].get("trades"), (int, float)), "per_symbol[AAPL]['trades'] in holdout should be numeric"
 
     # Additional check: ensure OOS trades do not include any dates on or after the holdout start
     # Read the OOS trades CSV and parse the "date" column
@@ -443,15 +486,21 @@ def test_cli_backtest_sweep_warmup_includes_previous_trading_day(tmp_path, monke
     # Determine two consecutive trading days (skip weekends)
     day1 = date(2025, 1, 6)  # Monday
     day2 = day1 + timedelta(days=1)  # Tuesday
-    # Setup database and insert bars for both days
+    # Setup database and insert bars for multiple trading days including day1 and day2
     db_url = _setup_database(tmp_path)
     monkeypatch.setenv("DATABASE_URL", db_url)
     engine = create_engine(db_url)
-    for d in [day1, day2]:
-        prices = [100 + i * 0.1 for i in range(26)]
-        bars = _make_bars_for_day(d, prices)
-        with engine.begin() as conn:
-            conn.execute(_bars_table.insert(), bars)
+    # Insert at least 10 trading days starting from day1 to satisfy warmup threshold
+    days_inserted = 0
+    cur_day = day1
+    while days_inserted < 10:
+        if cur_day.weekday() < 5:
+            prices = [100 + i * 0.1 for i in range(26)]
+            bars = _make_bars_for_day(cur_day, prices)
+            with engine.begin() as conn:
+                conn.execute(_bars_table.insert(), bars)
+            days_inserted += 1
+        cur_day = cur_day + timedelta(days=1)
     engine.dispose()
     # Compute expected warmup date (previous trading day)
     expected_warmup_date = day1

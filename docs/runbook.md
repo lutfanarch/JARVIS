@@ -5,36 +5,85 @@ JARVIS system in production.  It describes required environment
 variables, a daily operational checklist, healthcheck usage and
 troubleshooting tips keyed by healthcheck codes.
 
-## Local Windows Quickstart
+## Local Deployment (Windows)
 
-JARVIS is designed to run end‑to‑end on a Windows laptop without Docker
-or Bash.  Follow this sequence in a Windows PowerShell terminal to
-get started with a local SQLite database and verify your installation:
+JARVIS is designed to run end‑to‑end on a Windows laptop without
+requiring a container runtime or Bash.  Use the following PowerShell
+commands to set up a local installation from source, initialise the
+database, verify your installation and schedule the daily scan.  Each
+code block can be copied and pasted directly into a PowerShell
+terminal.
 
-```powershell
-# Set required environment variables (SQLite by default)
-$env:DATABASE_URL = "sqlite:///./jarvis.db"
-# Set run mode to shadow to suppress live notifications during testing
-$env:JARVIS_RUN_MODE = "shadow"
+1. **Create and activate a virtual environment (optional)** – isolate
+   your Python packages:
 
-# Initialize the database schema
-jarvis db-init
+   ```powershell
+   python -m venv .venv
+   .\.venv\Scripts\Activate.ps1
+   ```
 
-# Run the offline smoke test to verify migrations, healthchecks,
-# the daily scan and the scheduler.  This command writes a
-# decision file under artifacts/decisions and prints a summary.
-jarvis smoke-test
+2. **Install the package** – from the repository root install in
+   editable mode for development or standard mode for production:
 
-# Compute the next scheduled run time (10:15 America/New_York)
-jarvis scheduler --dry-run
-```
+   ```powershell
+   # Development install with test dependencies
+   pip install -e '.[dev]'
 
-The smoke test runs in shadow mode, requires no Alpaca or Telegram
-credentials and always emits a decision artifact under
-`artifacts/decisions/<run_id>.json`.  Use this as your first
-verification after installation.  When ready to run the pipeline
-automatically every weekday, remove the `--dry-run` flag from the
-scheduler command (leaving it running in its own window or service).
+   # Production install (omit --editable)
+   # pip install .
+   ```
+
+3. **Initialise the database** – set the database URL and run the
+   migration command.  SQLite is used by default for local testing:
+
+   ```powershell
+   $env:DATABASE_URL = "sqlite:///./jarvis.db"
+   jarvis db-init
+   ```
+
+4. **Run a smoke test** – verify migrations, health checks, the daily
+   scan and the scheduler in one command.  This writes a decision
+   file under `artifacts/decisions` and prints a summary.  The
+   database path and run identifier are configurable:
+
+   ```powershell
+   jarvis smoke-test --db-path ./jarvis_smoke.db --run-id deploy_smoke --keep
+   ```
+
+5. **Check your configuration** – confirm that your environment
+   variables are correct for the desired mode.  In shadow mode no
+   API keys are required and the command should exit successfully.  In
+   live mode it will fail until you set your keys (Alpaca, OpenAI,
+   Gemini):
+
+   ```powershell
+   jarvis config-check --mode shadow  # expected to return 0
+   jarvis config-check --mode live    # expected to return non-zero until keys are set
+   ```
+
+6. **Schedule the daily scan** – run the built‑in scheduler to
+   execute the daily scan automatically at 10:15 AM America/New_York
+   on weekdays.  Use `--run-mode shadow` for offline testing or
+   `--run-mode live` when ready to trade.  The scheduler loops
+   indefinitely; omit `--run-mode` to use the default `shadow`:
+
+   ```powershell
+   # Shadow testing (no live notifications)
+   jarvis scheduler --run-mode shadow
+
+   # Live operation (requires API keys and notification config)
+   # jarvis scheduler --run-mode live
+   ```
+
+   The scheduler computes the next run time based on the
+   `JARVIS_SCAN_TZ` environment variable (default
+   `America/New_York`) and sleeps until that moment before
+   invoking `jarvis daily-scan`.  Daylight saving time is handled
+   automatically.
+
+These steps provide a deterministic, Windows‑friendly path to deploy
+JARVIS locally.  No Bash scripts or container runtimes are required
+for installation, testing or daily operation.
 
 ## Required Environment Variables
 
@@ -122,18 +171,13 @@ decision making and optional notification.  This command always
 produces a decision file under `artifacts/decisions/<run_id>.json`
 even if earlier stages fail.
 
-To schedule the daily scan without Docker, use the built‑in
+To schedule the daily scan, use the built‑in
 `jarvis scheduler` command.  It computes the next run time at
 10:15 AM in the timezone specified by `JARVIS_SCAN_TZ` (default
 `America/New_York`), sleeps until that moment and then executes
 `jarvis daily-scan`.  The scheduler loops forever by default; supply
 `--once` to run a single scan or `--dry-run` to print the next
-scheduled run without sleeping or executing.  When using Docker, the
-compose file under `deploy/docker/` provisions a scheduler service
-that reads the `JARVIS_SCAN_TZ` and `JARVIS_SCAN_CRON` variables
-(default schedule `15 10 * * 1-5` which corresponds to 10:15 AM
-New York time on weekdays) to trigger the scan.  Adjust these
-variables to suit your deployment environment and market hours.
+scheduled run without sleeping or executing.
 
 ## Phase 2: Multi‑LLM Provider Policy and Role Routing
 
@@ -232,14 +276,14 @@ pipeline stages.
 
 ## Local Daily Scan and Scheduler
 
-For Windows and other local deployments without Docker, use the built‑in
-Python orchestrator instead of the Bash script.  The `jarvis
-daily-scan` command runs the entire end‑to‑end workflow (health
-checks, ingestion, corporate actions, quality assurance, feature
-computation, chart rendering, packet assembly, decision making,
-optional notification and forward testing) without relying on a shell.
-Failures in intermediate steps are logged but do not abort the run, and
-a decision JSON file is always produced under
+For Windows and other local deployments, use the built‑in
+Python orchestrator instead of any container‑based approach or Bash
+script.  The `jarvis daily-scan` command runs the entire end‑to‑end
+workflow (health checks, ingestion, corporate actions, quality
+assurance, feature computation, chart rendering, packet assembly,
+decision making, optional notification and forward testing) without
+relying on a shell.  Failures in intermediate steps are logged but do
+not abort the run, and a decision JSON file is always produced under
 `artifacts/decisions/<run_id>.json`.
 
 To perform a one‑off run on Windows PowerShell:
@@ -250,8 +294,8 @@ jarvis db-init
 jarvis daily-scan --run-mode shadow
 ```
 
-To schedule the daily scan to run automatically at 10:15 AM New York time
-on weekdays without Docker, use `jarvis scheduler`.  The scheduler is
+To schedule the daily scan to run automatically at 10:15 AM New York
+time on weekdays, use `jarvis scheduler`.  The scheduler is
 DST‑aware and anchors to the `America/New_York` timezone by default.
 It computes the next run time and sleeps until then before invoking
 `jarvis daily-scan`.  You can preview the next scheduled run without

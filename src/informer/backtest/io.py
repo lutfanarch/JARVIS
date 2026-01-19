@@ -13,7 +13,7 @@ import csv
 import json
 import os
 from dataclasses import asdict
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 
 from ..config import UNIVERSE_VERSION
 from .metrics import Trade
@@ -71,30 +71,42 @@ def write_reasons_csv(reasons: List[Dict[str, Any]], out_path: str) -> None:
 
 
 def write_summary_json(
-    summary: Dict[str, Any], config: BacktestConfig, out_path: str
+    summary: Dict[str, Any],
+    config: BacktestConfig,
+    out_path: str,
+    cost_model: Optional["CostModel"] = None,
 ) -> None:
     """Write backtest summary and configuration to a JSON file.
 
     The output includes the user‑supplied config parameters along with
-    computed metrics and version information.
+    computed metrics and version information.  If a cost model is
+    provided, its parameters are nested under ``config.cost_model``
+    in the output so that assumptions are persisted with the run.
     """
     _ensure_dir(os.path.dirname(out_path))
+    cfg_dict = {
+        "symbols": config.symbols,
+        "start_date": config.start_date.isoformat(),
+        "end_date": config.end_date.isoformat(),
+        "initial_cash": config.initial_cash,
+        "decision_time": config.decision_time.strftime("%H:%M"),
+        "decision_tz": config.decision_tz,
+        "k_stop": config.k_stop,
+        "k_target": config.k_target,
+        "score_threshold": config.score_threshold,
+        "risk_cap_pct": config.risk_cap_pct,
+        "risk_cap_fixed": config.risk_cap_fixed,
+        "extra_params": config.extra_params,
+    }
+    if cost_model is not None:
+        # Persist cost model parameters deterministically under config
+        cfg_dict["cost_model"] = {
+            "slippage_bps": cost_model.slippage_bps,
+            "commission_per_share": cost_model.commission_per_share,
+        }
     out = {
         "universe_version": UNIVERSE_VERSION,
-        "config": {
-            "symbols": config.symbols,
-            "start_date": config.start_date.isoformat(),
-            "end_date": config.end_date.isoformat(),
-            "initial_cash": config.initial_cash,
-            "decision_time": config.decision_time.strftime("%H:%M"),
-            "decision_tz": config.decision_tz,
-            "k_stop": config.k_stop,
-            "k_target": config.k_target,
-            "score_threshold": config.score_threshold,
-            "risk_cap_pct": config.risk_cap_pct,
-            "risk_cap_fixed": config.risk_cap_fixed,
-            "extra_params": config.extra_params,
-        },
+        "config": cfg_dict,
         "metrics": summary,
     }
     with open(out_path, "w") as f:

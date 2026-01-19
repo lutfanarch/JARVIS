@@ -76,9 +76,18 @@ class CandidateEvaluation(BaseModel):
 
 
 class ArbiterDecision(BaseModel):
-    """Decision from the arbiter on which candidate to trade (if any)."""
+    """Decision from the arbiter on which candidate to trade (if any).
 
-    action: Literal["TRADE", "NO_TRADE"]
+    In addition to the normal trade and no‑trade actions, the arbiter may
+    produce a ``NOT_READY`` decision when the system is not properly
+    configured to operate (e.g., missing API credentials).  Downstream
+    validation and sizing must treat this as a terminal state and
+    propagate the action without attempting to compute trade parameters.
+    """
+
+    # The arbiter may either select a trade ("TRADE"), decline to trade
+    # ("NO_TRADE"), or signal that the system is not ready ("NOT_READY").
+    action: Literal["TRADE", "NO_TRADE", "NOT_READY"]
     symbol: Optional[str] = None
     entry: Optional[float] = None
     stop: Optional[float] = None
@@ -105,7 +114,12 @@ class FinalDecision(BaseModel):
     whitelist: List[str]
     max_risk_usd: float
     cash_usd: Optional[float] = None
-    action: Literal["TRADE", "NO_TRADE"]
+    # Final action of the decision.  In addition to "TRADE" and
+    # "NO_TRADE", the validator may emit "NOT_READY" when the
+    # prerequisite environment for live operation is missing.  The
+    # presence of "NOT_READY" indicates that no sizing or risk
+    # calculations were performed.
+    action: Literal["TRADE", "NO_TRADE", "NOT_READY"]
     trade_date_ny: str
     symbol: Optional[str] = None
     entry: Optional[float] = None
@@ -117,6 +131,13 @@ class FinalDecision(BaseModel):
     confidence: Optional[float] = None
     reason_codes: List[str] = Field(default_factory=list)
     audit: Dict[str, Any] = Field(default_factory=dict)
+
+    # Optional proprietary trading profile metadata.  When a
+    # ``PROP_PROFILE`` is enabled and the trade passes validation, the
+    # validator attaches a ``prop`` block summarising the risk budget,
+    # profit cap and other evaluation parameters.  This field is
+    # omitted for ``NO_TRADE`` or ``NOT_READY`` decisions.
+    prop: Optional[Dict[str, Any]] = None
 
     class Config:
         json_encoders = {

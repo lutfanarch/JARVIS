@@ -18,7 +18,10 @@ from alembic import context
 config = context.config
 fileConfig(config.config_file_name)
 
-target_metadata = None  # We use explicit migrations rather than autogenerate
+# We use explicit migrations rather than autogenerate, so there is no
+# metadata to reflect.  If autogenerate is desired in the future,
+# assign your SQLAlchemy MetaData object here.
+target_metadata = None
 
 
 def run_migrations_offline() -> None:

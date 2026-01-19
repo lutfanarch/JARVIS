@@ -247,3 +247,48 @@ def compute_regime_breakdown(trades: List[Trade]) -> Dict[str, Any]:
     for k, v in combo_map.items():
         breakdown["combined"][k] = _aggregate_regime_stats(v)
     return breakdown
+
+
+def compute_per_symbol_summary(
+    trades: List[Trade], initial_cash: float, dates: List[str]
+) -> Dict[str, Any]:
+    """Compute per‑symbol summary metrics.
+
+    This helper iterates over all symbols present in the ``trades`` list
+    and computes an individual equity curve and summary statistics for
+    each symbol.  The per‑symbol equity curve starts at
+    ``initial_cash`` and accumulates only the PnL from trades on that
+    symbol.  Summary metrics are derived using :func:`compute_summary` on
+    the filtered trades and curve.  Symbols are processed in
+    alphabetical order to ensure deterministic ordering of the returned
+    dictionary.
+
+    Parameters
+    ----------
+    trades : list of Trade
+        Executed trades across one or more symbols.
+    initial_cash : float
+        Starting cash balance used for each per‑symbol equity curve.
+    dates : list of str
+        Sorted list of trading day strings (YYYY‑MM‑DD) over which to
+        compute the equity curves.
+
+    Returns
+    -------
+    dict
+        Mapping from symbol to summary metrics dictionary.  Keys are
+        sorted alphabetically.  If no trades exist for a symbol, no
+        entry is created.
+    """
+    # Identify unique symbols from trades
+    symbols = sorted({tr.symbol for tr in trades})
+    result: Dict[str, Any] = {}
+    for sym in symbols:
+        # Filter trades for this symbol
+        sym_trades = [tr for tr in trades if tr.symbol == sym]
+        # Build equity curve for this symbol using only its trades
+        curve = equity_curve(sym_trades, initial_cash, dates)
+        # Compute summary metrics
+        summary = compute_summary(sym_trades, curve)
+        result[sym] = summary
+    return result

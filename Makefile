@@ -2,7 +2,7 @@
 # that `make handoff` creates a deterministic ZIP with the current
 # ticket identifier.  Update this value whenever a new ticket is
 # completed so that the generated artifact reflects the correct version.
-HANDOFF_ZIP ?= jarvis_repo_ticket16_22.zip
+HANDOFF_ZIP ?= jarvis_repo_ticket18_25.zip
 
 .PHONY: help init-db tests lint format clean handoff handoff-verify
 

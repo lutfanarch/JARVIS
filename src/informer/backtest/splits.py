@@ -30,6 +30,45 @@ from zoneinfo import ZoneInfo
 import pandas as pd
 
 
+def filter_rth_bars(
+    bars: Iterable[Dict[str, Any]], tz: str = "America/New_York"
+) -> List[Dict[str, Any]]:
+    """Filter bars to include only Regular Trading Hours (RTH).
+
+    This helper drops any bars that start outside the regular trading
+    session for the configured timezone.  Only bars whose local start
+    time is between 09:30 (inclusive) and 16:00 (exclusive) are
+    retained.  Bars are assumed to have ``ts`` timestamps in UTC.
+
+    Parameters
+    ----------
+    bars : iterable of dict
+        Sequence of bar dictionaries containing a ``ts`` key with
+        timezone-aware UTC datetime values.
+    tz : str, optional
+        Timezone name for converting bar timestamps.  Defaults to
+        "America/New_York".
+
+    Returns
+    -------
+    list of dict
+        Filtered bars sorted by ``ts`` ascending.
+    """
+    zone = ZoneInfo(tz)
+    rth_start = time(9, 30)  # 09:30 local time
+    rth_end = time(16, 0)    # 16:00 local time (exclusive)
+    result: List[Dict[str, Any]] = []
+    for b in bars:
+        ts = b.get("ts")
+        if not ts:
+            continue
+        local_time = ts.astimezone(zone).time()
+        # Include bar if start time is within RTH window
+        if rth_start <= local_time < rth_end:
+            result.append(b)
+    return result
+
+
 def trading_days(start_date: date, end_date: date) -> List[date]:
     """Return a list of trading dates (weekdays) between start and end inclusive.
 
@@ -191,3 +230,33 @@ def aggregate_bars(
             }
         )
     return result
+
+
+# Warmup bars requirement
+
+def required_warmup_bars(timeframe: str) -> int:
+    """Return the minimum number of bars required before trading can commence.
+
+    The backtest strategy relies on moving averages and other indicators
+    that require a sufficient history to stabilize.  To avoid look‑ahead
+    bias and unstable early values, a warmup period is enforced.  For
+    supported timeframes (15m, 1h and daily) this returns the maximum
+    lookback used by the indicators (currently 200 for EMA200).  For
+    any other timeframe, a default of 200 is returned.
+
+    Parameters
+    ----------
+    timeframe : str
+        A string representing the bar timeframe (e.g., "15m", "1h", "daily").
+
+    Returns
+    -------
+    int
+        The number of bars required before trading decisions may be made.
+    """
+    tf = timeframe.lower()
+    # Enforce a fixed warmup equal to the longest EMA lookback used
+    if tf in {"15m", "1h", "daily"}:
+        return 200
+    # Fallback to 200 for any unrecognized timeframe
+    return 200

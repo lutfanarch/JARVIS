@@ -19,7 +19,7 @@ import click
 
 from ..config import UNIVERSE_VERSION
 from ..providers.alpaca import PROVIDER_VERSION
-from .registry import load_registry, record_run, append_outcome
+from .registry import load_registry, record_run, append_outcome, load_outcomes
 
 
 def _compute_trade_date_ny(as_of: datetime) -> str:
@@ -199,28 +199,173 @@ def record_command(run_id: str, as_of_str: str, mode: Optional[str]) -> None:
 @forwardtest.command("list")
 @click.option("--start", type=str, default=None, help="Start NY date (YYYY-MM-DD) for filtering runs.")
 @click.option("--end", type=str, default=None, help="End NY date (YYYY-MM-DD) for filtering runs.")
-def list_command(start: Optional[str], end: Optional[str]) -> None:
-    """List recorded forward-test runs.
+@click.option(
+    "--with-outcomes",
+    is_flag=True,
+    default=False,
+    help="Include outcome status and realised PnL/R columns in the output.",
+)
+@click.option(
+    "--only-missing-outcomes",
+    is_flag=True,
+    default=False,
+    help="Show only TRADE runs where no outcome has been logged.",
+)
+def list_command(
+    start: Optional[str],
+    end: Optional[str],
+    with_outcomes: bool,
+    only_missing_outcomes: bool,
+) -> None:
+    """List recorded forward‑test runs.
 
-    The list includes the NY date, run_id, decision status and selected symbol.
+    By default the list shows the New York trade date, run identifier,
+    decision status and selected symbol for each recorded run.  When
+    ``--with-outcomes`` is supplied, additional columns indicate
+    whether a matching outcome has been logged and the realised
+    performance metrics (PnL in USD and R multiple) per run.  Use
+    ``--only-missing-outcomes`` to filter to TRADE runs that still
+    require manual outcome logging.
     """
     entries = load_registry()
     # Filter by date range if provided
     def in_range(date_str: str) -> bool:
-        if start:
+        if start and date_str:
             if date_str < start:
                 return False
-        if end:
+        if end and date_str:
             if date_str > end:
                 return False
         return True
     filtered = [e for e in entries if in_range(e.get("ny_date", ""))]
-    # Sort by ny_date then run_id
+    # Sort by ny_date then run_id for deterministic output
     filtered.sort(key=lambda x: (x.get("ny_date"), x.get("run_id")))
-    # Print header
-    click.echo("ny_date\trun_id\tstatus\tsymbol")
+    # Load outcomes mapping when needed
+    outcome_map = {}
+    if with_outcomes or only_missing_outcomes:
+        outcomes = load_outcomes()
+        # Build a mapping from (ny_date, symbol) to the latest outcome record
+        for o in outcomes:
+            key = (o.get("ny_date"), o.get("symbol"))
+            # Each successive assignment overwrites prior ones; since load_outcomes
+            # returns records sorted by (ny_date, symbol, recorded_at_utc),
+            # the last record for a key is the most recent.
+            outcome_map[key] = o
+    # Determine header
+    if with_outcomes:
+        header = "ny_date\trun_id\tstatus\tsymbol\toutcome_logged\tpnl_usd\tr\tentry_source"
+    else:
+        header = "ny_date\trun_id\tstatus\tsymbol"
+    click.echo(header)
     for e in filtered:
-        click.echo(f"{e.get('ny_date','')}\t{e.get('run_id','')}\t{e.get('decision_status','')}\t{e.get('selected_symbol') or '-'}")
+        ny_date = e.get("ny_date", "")
+        run_id = e.get("run_id", "")
+        status = e.get("decision_status", "")
+        symbol = e.get("selected_symbol") or "-"
+        # When filtering for missing outcomes, skip non-TRADE or runs with outcomes
+        if only_missing_outcomes:
+            if status != "TRADE":
+                continue
+            # Determine if an outcome exists for this run
+            outcome_rec = outcome_map.get((ny_date, symbol))
+            if outcome_rec is not None:
+                # If a matching outcome exists, skip
+                continue
+        # Base row fields
+        if not with_outcomes:
+            click.echo(f"{ny_date}\t{run_id}\t{status}\t{symbol}")
+            continue
+        # Populate outcome and metric fields
+        outcome_logged: str
+        pnl_str: str
+        r_str: str
+        entry_source: str
+        if status != "TRADE":
+            # Non-trade runs: no outcome expected
+            outcome_logged = "-"
+            pnl_str = "-"
+            r_str = "-"
+            entry_source = "-"
+        else:
+            outcome_rec = outcome_map.get((ny_date, symbol))
+            if outcome_rec is None:
+                # Missing outcome
+                outcome_logged = "N"
+                pnl_str = "-"
+                r_str = "-"
+                entry_source = "-"
+            else:
+                outcome_logged = "Y"
+                # Attempt to compute realised metrics
+                # Read decision file to extract entry, stop and shares
+                decision_entry = None
+                stop_price = None
+                shares = None
+                artifact_dir = e.get("artifact_dir")
+                if artifact_dir:
+                    decision_path = Path(artifact_dir) / "decision.json"
+                    try:
+                        with decision_path.open("r", encoding="utf-8") as f:
+                            decision_data = json.load(f)
+                        if isinstance(decision_data, dict):
+                            decision_entry = decision_data.get("entry")
+                            stop_price = decision_data.get("stop")
+                            shares = decision_data.get("shares")
+                    except Exception:
+                        # Cannot load decision; treat as missing
+                        pass
+                # Convert numeric fields when possible
+                try:
+                    decision_entry_val = float(decision_entry) if decision_entry is not None else None
+                except Exception:
+                    decision_entry_val = None
+                try:
+                    stop_val = float(stop_price) if stop_price is not None else None
+                except Exception:
+                    stop_val = None
+                try:
+                    shares_val = int(shares) if shares is not None else None
+                except Exception:
+                    shares_val = None
+                # Determine realised entry: outcome entry if present else decision entry
+                realised_entry = None
+                entry_src = "decision"
+                if "entry" in outcome_rec and outcome_rec.get("entry") is not None:
+                    try:
+                        realised_entry = float(outcome_rec.get("entry"))
+                        entry_src = "outcome"
+                    except Exception:
+                        realised_entry = None
+                        entry_src = "outcome"
+                if realised_entry is None:
+                    realised_entry = decision_entry_val
+                    entry_src = "decision"
+                # Realised exit
+                try:
+                    exit_val = float(outcome_rec.get("exit"))
+                except Exception:
+                    exit_val = None
+                # Compute pnl and r if all required values present
+                if realised_entry is not None and shares_val is not None and exit_val is not None:
+                    pnl_usd = (exit_val - realised_entry) * shares_val
+                    # Compute R if stop is valid and denominator non-zero
+                    r_value: Optional[float] = None
+                    if stop_val is not None and (realised_entry - stop_val) != 0:
+                        try:
+                            r_value = (exit_val - realised_entry) / (realised_entry - stop_val)
+                        except Exception:
+                            r_value = None
+                    pnl_str = f"{pnl_usd}"  # string representation of float
+                    r_str = f"{r_value}" if r_value is not None else "-"
+                    entry_source = entry_src
+                else:
+                    pnl_str = "-"
+                    r_str = "-"
+                    entry_source = entry_src if realised_entry is not None else "-"
+        # Emit row with outcome columns
+        click.echo(
+            f"{ny_date}\t{run_id}\t{status}\t{symbol}\t{outcome_logged}\t{pnl_str}\t{r_str}\t{entry_source}"
+        )
 
 
 @forwardtest.command("report")
@@ -231,26 +376,201 @@ def report_command(start: str, end: str, out_path: str) -> None:
     """Generate a summary report for forward-test runs.
 
     The report includes counts by status and symbol frequency within
-    the specified date range.  Outcomes recorded via
-    ``forwardtest-log-outcome`` are not yet considered in this report.
+    the specified date range and aggregates outcome metrics when
+    realised outcomes have been logged via ``forwardtest-log-outcome``.
     """
     entries = load_registry()
     # Filter entries within date range
-    filtered = [
+    filtered_runs = [
         e
         for e in entries
         if start <= e.get("ny_date", "") <= end
     ]
     summary: Dict[str, Any] = {
-        "total_runs": len(filtered),
+        "total_runs": len(filtered_runs),
         "status_counts": {},
         "symbol_counts": {},
     }
-    for e in filtered:
+    for e in filtered_runs:
         status = e.get("decision_status", "")
         sym = e.get("selected_symbol") or "-"
         summary["status_counts"][status] = summary["status_counts"].get(status, 0) + 1
         summary["symbol_counts"][sym] = summary["symbol_counts"].get(sym, 0) + 1
+
+    # Load outcomes and filter by date range
+    outcomes = load_outcomes()
+    filtered_outcomes = [
+        o for o in outcomes if start <= o.get("ny_date", "") <= end
+    ]
+
+    # Build a mapping of runs keyed by (ny_date, selected_symbol) to the latest run entry
+    runs_by_key: Dict[tuple, list] = {}
+    for e in entries:
+        if e.get("decision_status") != "TRADE":
+            continue
+        ny_date = e.get("ny_date")
+        symbol = e.get("selected_symbol")
+        if not ny_date or not symbol:
+            continue
+        key = (ny_date, symbol)
+        runs_by_key.setdefault(key, []).append(e)
+    # Sort lists by created_at_utc to ensure the last element is the most recent
+    for key, lst in runs_by_key.items():
+        lst.sort(key=lambda r: r.get("created_at_utc", ""))
+
+    outcomes_rows: list[Dict[str, Any]] = []
+    matched_pnls: list[float] = []
+    matched_rs: list[float] = []
+    # Track daily pnl sums for max drawdown calculation
+    daily_pnl: Dict[str, float] = {}
+
+    from pathlib import Path as _Path  # avoid shadowing outer Path
+
+    for outcome in filtered_outcomes:
+        ny_date = outcome.get("ny_date")
+        symbol = outcome.get("symbol")
+        if not ny_date or not symbol:
+            continue
+        key = (ny_date, symbol)
+        run_list = runs_by_key.get(key)
+        if not run_list:
+            # Outcome without a matching TRADE run is skipped
+            continue
+        # Use the most recent run (last after sorting by created_at_utc)
+        run = run_list[-1]
+        run_id = run.get("run_id")
+        artifact_dir = run.get("artifact_dir")
+        if not run_id or not artifact_dir:
+            continue
+        # Load the decision file
+        decision_path = _Path(artifact_dir) / "decision.json"
+        try:
+            with decision_path.open("r", encoding="utf-8") as df:
+                decision_data = json.load(df)
+        except Exception:
+            continue
+        # Extract entry, stop, shares from decision
+        decision_entry = None
+        stop_price = None
+        shares = None
+        if isinstance(decision_data, dict):
+            decision_entry = decision_data.get("entry")
+            stop_price = decision_data.get("stop")
+            shares = decision_data.get("shares")
+        # Validate numeric types
+        try:
+            decision_entry_val = float(decision_entry) if decision_entry is not None else None
+            stop_val = float(stop_price) if stop_price is not None else None
+            shares_val = int(shares) if shares is not None else None
+        except Exception:
+            # Invalid numeric values
+            continue
+        if shares_val is None:
+            continue
+        # Determine realised entry: prefer outcome entry when available
+        entry_source = "decision"
+        outcome_entry_val: Optional[float] = None
+        if "entry" in outcome and outcome.get("entry") is not None:
+            try:
+                outcome_entry_val = float(outcome["entry"])
+            except Exception:
+                outcome_entry_val = None
+        if outcome_entry_val is not None:
+            entry_realised = outcome_entry_val
+            entry_source = "outcome"
+        else:
+            # fallback to decision entry
+            entry_realised = decision_entry_val
+        # Require a valid entry price
+        if entry_realised is None:
+            continue
+        # Compute exit
+        exit_realised = None
+        try:
+            exit_realised = float(outcome.get("exit"))
+        except Exception:
+            continue
+        # Compute realised pnl and R
+        pnl_usd = (exit_realised - entry_realised) * shares_val
+        # Determine R: (exit - entry) / (entry - stop)
+        r_value = None
+        if stop_val is not None and (entry_realised - stop_val) != 0:
+            try:
+                r_value = (exit_realised - entry_realised) / (entry_realised - stop_val)
+            except Exception:
+                r_value = None
+        # Append metrics
+        matched_pnls.append(pnl_usd)
+        if r_value is not None:
+            matched_rs.append(r_value)
+        # Accumulate daily pnl
+        daily_pnl[ny_date] = daily_pnl.get(ny_date, 0.0) + pnl_usd
+        # Build row record
+        row = {
+            "ny_date": ny_date,
+            "symbol": symbol,
+            "run_id": run_id,
+            "entry_realised": entry_realised,
+            "exit_realised": exit_realised,
+            "shares": shares_val,
+            "stop": stop_val,
+            "pnl_usd": pnl_usd,
+            "r": r_value,
+            "notes": outcome.get("notes"),
+            "entry_source": entry_source,
+        }
+        outcomes_rows.append(row)
+
+    # Compute outcome summary metrics
+    outcomes_total = len(matched_pnls)
+    if outcomes_total > 0:
+        win_count = sum(1 for p in matched_pnls if p > 0)
+        win_rate = win_count / outcomes_total
+        total_pnl = sum(matched_pnls)
+        avg_pnl = total_pnl / outcomes_total
+    else:
+        win_rate = 0.0
+        total_pnl = 0.0
+        avg_pnl = 0.0
+    # Expectancy (average R) across outcomes where R is defined
+    expectancy_r = None
+    if matched_rs:
+        expectancy_r = sum(matched_rs) / len(matched_rs)
+    # Profit factor: sum of wins / abs(sum losses), or None if no losses
+    profit_factor = None
+    if matched_pnls:
+        sum_wins = sum(p for p in matched_pnls if p > 0)
+        sum_losses = sum(p for p in matched_pnls if p < 0)
+        if sum_losses < 0:
+            profit_factor = sum_wins / abs(sum_losses)
+        # else remain None when there are no losses
+    # Max drawdown: compute equity curve from daily pnl per ny_date
+    max_drawdown = 0.0
+    if daily_pnl:
+        cum_equity = 0.0
+        peak = 0.0
+        for date_key in sorted(daily_pnl.keys()):
+            cum_equity += daily_pnl[date_key]
+            if cum_equity > peak:
+                peak = cum_equity
+            drawdown = peak - cum_equity
+            if drawdown > max_drawdown:
+                max_drawdown = drawdown
+
+    outcomes_summary = {
+        "outcomes_total": outcomes_total,
+        "outcomes_win_rate": win_rate,
+        "outcomes_total_pnl_usd": total_pnl,
+        "outcomes_avg_pnl_usd": avg_pnl,
+        "outcomes_expectancy_r": expectancy_r,
+        "outcomes_profit_factor": profit_factor,
+        "outcomes_max_drawdown_usd": max_drawdown,
+    }
+
+    # Attach outcomes summary and rows to the report
+    summary["outcomes_summary"] = outcomes_summary
+    summary["outcomes_rows"] = outcomes_rows
+
     # Write out as JSON
     out_file = Path(out_path)
     out_file.parent.mkdir(parents=True, exist_ok=True)
@@ -260,21 +580,149 @@ def report_command(start: str, end: str, out_path: str) -> None:
 
 
 @forwardtest.command("log-outcome")
-@click.option("--ny-date", required=True, type=str, help="NY trade date for which to log the outcome.")
-@click.option("--symbol", required=True, type=str, help="Symbol traded in the forward test.")
-@click.option("--entry", required=True, type=float, help="Realised entry price.")
+@click.option(
+    "--run-id",
+    type=str,
+    default=None,
+    help="Run identifier from the forward-test registry; when supplied, the NY date and symbol are derived automatically.",
+)
+@click.option(
+    "--ny-date",
+    required=False,
+    type=str,
+    help="NY trade date for which to log the outcome (required when --run-id is not provided).",
+)
+@click.option(
+    "--symbol",
+    required=False,
+    type=str,
+    help="Symbol traded in the forward test (required when --run-id is not provided).",
+)
+@click.option(
+    "--entry",
+    required=False,
+    type=float,
+    default=None,
+    show_default=False,
+    help="Realised entry price. If omitted, the entry from the decision will be used in the report.",
+)
 @click.option("--exit", required=True, type=float, help="Realised exit price.")
 @click.option("--notes", type=str, default=None, help="Optional notes about the outcome.")
-def log_outcome_command(ny_date: str, symbol: str, entry: float, exit: float, notes: Optional[str]) -> None:
-    """Log a realised trade outcome for a forward-test run.
+@click.option(
+    "--duration-seconds",
+    type=int,
+    required=False,
+    help="Optional trade duration in seconds.  When provided, this value is stored in the outcome record.",
+)
+def log_outcome_command(
+    run_id: Optional[str],
+    ny_date: Optional[str],
+    symbol: Optional[str],
+    entry: Optional[float],
+    exit: float,
+    notes: Optional[str],
+    duration_seconds: Optional[int],
+) -> None:
+    """Log a realised trade outcome for a forward‑test run.
 
     The outcome is appended to a JSONL file separate from the run registry.
+    You may specify either ``--run-id`` to derive the NY date and symbol
+    automatically from the recorded run, or provide ``--ny-date`` and
+    ``--symbol`` explicitly.  When both run-id and ny-date/symbol are
+    supplied, the command fails with exit code 2 to avoid ambiguity.
+    A realised entry price is optional; if omitted, the report will
+    fall back to the decision entry when computing realised metrics.
     """
+    # Validate mutually exclusive options
+    import sys
+    # Case: both run-id and explicit date/symbol provided
+    if run_id and (ny_date or symbol):
+        click.echo(
+            "[error] Do not specify --ny-date or --symbol when using --run-id; supply either run-id or date/symbol, not both.",
+            err=True,
+        )
+        raise SystemExit(2)
+    # When run-id provided, derive ny_date and symbol from registry
+    if run_id:
+        entries = load_registry()
+        # Filter entries with matching run_id
+        matching = [e for e in entries if e.get("run_id") == run_id]
+        if not matching:
+            click.echo(f"[error] No forward-test run found with run_id {run_id}", err=True)
+            raise SystemExit(2)
+        # Pick the most recent entry by created_at_utc (lexicographically)
+        matching.sort(key=lambda x: x.get("created_at_utc", ""))
+        latest = matching[-1]
+        # Ensure it's a TRADE with a selected symbol
+        status = latest.get("decision_status")
+        selected_symbol = latest.get("selected_symbol")
+        if status != "TRADE" or not selected_symbol:
+            click.echo(
+                f"[error] Run {run_id} is not a TRADE or missing selected symbol (status={status})",
+                err=True,
+            )
+            raise SystemExit(2)
+        ny_date_derived = latest.get("ny_date")
+        if not ny_date_derived:
+            click.echo(
+                f"[error] Run {run_id} has no NY date recorded in registry", err=True
+            )
+            raise SystemExit(2)
+        ny_date = ny_date_derived
+        symbol = selected_symbol
+    else:
+        # Without run-id, both ny-date and symbol must be provided
+        if not ny_date or not symbol:
+            click.echo(
+                "[error] --ny-date and --symbol are required when --run-id is not provided",
+                err=True,
+            )
+            raise SystemExit(2)
+    # At this point, ny_date and symbol are populated
+    # Validate that duration_seconds, when provided, is non-negative
+    if duration_seconds is not None and duration_seconds < 0:
+        click.echo(
+            "[error] --duration-seconds must be a non-negative integer",
+            err=True,
+        )
+        raise SystemExit(2)
+    # Derive entry from decision.json when using --run-id and entry was omitted
+    if run_id and entry is None:
+        # Only attempt derivation if the latest registry entry has an artifact_dir
+        artifact_dir = latest.get("artifact_dir") if 'latest' in locals() else None
+        if isinstance(artifact_dir, str):
+            dec_path = Path(artifact_dir) / "decision.json"
+            try:
+                with dec_path.open("r", encoding="utf-8") as df:
+                    dec_data = json.load(df)
+                if isinstance(dec_data, dict):
+                    maybe_entry = dec_data.get("entry")
+                    if isinstance(maybe_entry, (int, float)):
+                        entry = float(maybe_entry)
+                    elif isinstance(maybe_entry, str):
+                        try:
+                            entry = float(maybe_entry)
+                        except Exception:
+                            pass
+            except Exception:
+                # If any error occurs while reading/decoding the decision file,
+                # leave entry unchanged (None)
+                pass
+    # Append the outcome record to the log
     append_outcome(
-        ny_date=ny_date,
-        symbol=symbol,
-        entry=entry,
+        ny_date=ny_date,  # type: ignore[arg-type]
+        symbol=symbol,  # type: ignore[arg-type]
         exit=exit,
+        entry=entry,
         notes=notes,
+        duration_seconds=duration_seconds,
     )
+    # If the realised outcome is profitable and no duration was provided, warn the user
+    if entry is not None and exit > entry and duration_seconds is None:
+        click.echo(
+            "WARNING: profitable outcome logged without duration_seconds; "
+            "specify --duration-seconds so valid profit can be evaluated",
+            err=False,
+        )
+    # Success message
     click.echo(f"Logged outcome for {ny_date} {symbol}")

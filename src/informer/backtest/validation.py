@@ -95,6 +95,7 @@ def run_backtest_for_params(
     overrides: Dict[str, Any],
     start_date: Optional[date] = None,
     end_date: Optional[date] = None,
+    cost_model: Optional["CostModel"] = None,
 ) -> Tuple[BacktestResult, Dict[str, Any]]:
     """Run a backtest with parameter overrides and return result and metrics.
 
@@ -130,7 +131,7 @@ def run_backtest_for_params(
     # Filter bars to date range to avoid look‑ahead
     bars_filtered = _filter_bars_by_date_range(bars_map, cfg.start_date, cfg.end_date, cfg.decision_tz)
     # Run engine
-    engine = BacktestEngine(config=cfg)
+    engine = BacktestEngine(config=cfg, cost_model=cost_model)
     result = engine.run(bars_filtered)
     # Compute metrics summary (already includes extended metrics)
     metrics = result.summary.copy()
@@ -145,6 +146,7 @@ def run_parameter_sweep(
     start_date: date,
     end_date: date,
     top_n: int = 10,
+    cost_model: Optional["CostModel"] = None,
 ) -> Tuple[List[Dict[str, Any]], Dict[str, Any], BacktestResult]:
     """Run a deterministic grid search over the parameter space.
 
@@ -176,7 +178,7 @@ def run_parameter_sweep(
     """
     grid = generate_param_grid(param_spec)
     results: List[Dict[str, Any]] = []
-    best_entry = None
+    best_entry: Optional[Dict[str, Any]] = None
     # Determine whether objective should be minimized
     minimize = objective in {"max_drawdown", "max_drawdown_pct"}
     for params in grid:
@@ -187,6 +189,7 @@ def run_parameter_sweep(
             params,
             start_date=start_date,
             end_date=end_date,
+            cost_model=cost_model,
         )
         obj_val = metrics.get(objective)
         # For None objective values (e.g., profit_factor when infinite),
@@ -207,7 +210,7 @@ def run_parameter_sweep(
         if best_entry is None:
             best_entry = entry
         else:
-            # Compare objective values; break ties via lexicographically sorted JSON of params
+            # Compare objective values; primary comparison on objective
             if minimize:
                 better = entry["_sort_val"] < best_entry["_sort_val"]
             else:
@@ -215,18 +218,47 @@ def run_parameter_sweep(
             if better:
                 best_entry = entry
             elif entry["_sort_val"] == best_entry["_sort_val"]:
-                # Tie – compare sorted JSON strings
-                current_json = json.dumps(entry["params"], sort_keys=True)
-                best_json = json.dumps(best_entry["params"], sort_keys=True)
-                if current_json < best_json:
+                # Tie on objective – apply deterministic tie‑break on parameter values
+                # Compare by k_stop (ascending), then k_target (ascending), then score_threshold (ascending),
+                # then lexicographically sorted JSON of any extra parameters.  Missing values are treated as +inf
+                def _tie_key(p: Dict[str, Any]) -> tuple:
+                    ks = p.get("k_stop")
+                    kt = p.get("k_target")
+                    st = p.get("score_threshold")
+                    ks_val = float("inf") if ks is None else ks
+                    kt_val = float("inf") if kt is None else kt
+                    st_val = float("inf") if st is None else st
+                    extras = {k: v for k, v in p.items() if k not in {"k_stop", "k_target", "score_threshold"}}
+                    extras_str = json.dumps(extras, sort_keys=True)
+                    return (ks_val, kt_val, st_val, extras_str)
+                current_key = _tie_key(entry["params"])
+                best_key = _tie_key(best_entry["params"])
+                if current_key < best_key:
                     best_entry = entry
-    # Sort results by objective (desc or asc) and tie-break by JSON
-    def sort_key(e: Dict[str, Any]) -> Tuple:
-        return (
-            e["_sort_val"],
-            json.dumps(e["params"], sort_keys=True),
-        )
-    results_sorted = sorted(results, key=sort_key, reverse=not minimize)
+    # Sort results for deterministic ordering.  Primary sort on objective value
+    # (descending for maximize, ascending for minimize) with tie‑break by parameter
+    # values: k_stop asc, k_target asc, score_threshold asc, then extra params JSON.
+    def _sort_key(e: Dict[str, Any]) -> Tuple:
+        # Determine the sort value for objective: use negative value for maximize so that
+        # sorting ascending places the largest objective first.  For minimize, use the
+        # raw value.  None objectives are mapped to +/-inf in obj_sort_val above.
+        sort_val_sign: float
+        if minimize:
+            sort_val_sign = e["_sort_val"]
+        else:
+            sort_val_sign = -e["_sort_val"]
+        p = e["params"]
+        ks = p.get("k_stop")
+        kt = p.get("k_target")
+        st = p.get("score_threshold")
+        ks_val = float("inf") if ks is None else ks
+        kt_val = float("inf") if kt is None else kt
+        st_val = float("inf") if st is None else st
+        extras = {k: v for k, v in p.items() if k not in {"k_stop", "k_target", "score_threshold"}}
+        extras_str = json.dumps(extras, sort_keys=True)
+        return (sort_val_sign, ks_val, kt_val, st_val, extras_str)
+
+    results_sorted = sorted(results, key=_sort_key)
     # Trim the list if top_n specified and smaller than total
     top_results = results_sorted[:top_n] if top_n and top_n < len(results_sorted) else results_sorted
     best_params = best_entry["params"] if best_entry else {}
@@ -255,6 +287,7 @@ def run_walkforward(
     step_days: Optional[int] = None,
     holdout_start: Optional[date] = None,
     holdout_days: Optional[int] = None,
+    cost_model: Optional["CostModel"] = None,
 ) -> Dict[str, Any]:
     """Run a walk‑forward validation over sequential trading day folds.
 
@@ -345,6 +378,7 @@ def run_walkforward(
             start_date=train_start,
             end_date=train_end,
             top_n=0,
+            cost_model=cost_model,
         )
         best_params = best_info.get("params", {})
         best_metrics_train = best_info.get("metrics", {})
@@ -355,6 +389,7 @@ def run_walkforward(
             best_params,
             start_date=test_start,
             end_date=test_end,
+            cost_model=cost_model,
         )
         # Append OOS trades
         oos_trades.extend(test_result.trades)
@@ -380,18 +415,24 @@ def run_walkforward(
     holdout_summary: Dict[str, Any] = {}
     if oos_trades:
         # Build curve over the entire evaluation date range for OOS trades
-        from .metrics import equity_curve
+        from .metrics import equity_curve, compute_per_symbol_summary
         date_strings = [d.isoformat() for d in day_list]
         oos_curve = equity_curve(oos_trades, base_cfg.initial_cash, date_strings)
         oos_summary = compute_summary(oos_trades, oos_curve)
-        # Include regime breakdown in summary
+        # Include per-symbol breakdown and regime breakdown in summary.  The per-symbol
+        # summary uses the same date_strings so that each symbol’s equity curve
+        # aligns with the global OOS period.  Sorting of keys is handled by the
+        # helper.
+        oos_summary["per_symbol"] = compute_per_symbol_summary(oos_trades, base_cfg.initial_cash, date_strings)
         oos_summary["regime_breakdown"] = compute_regime_breakdown(oos_trades)
     else:
         # No OOS trades: build curve over the entire evaluation date range and compute summary
-        from .metrics import equity_curve
+        from .metrics import equity_curve, compute_per_symbol_summary
         date_strings = [d.isoformat() for d in day_list]
         oos_curve = equity_curve([], base_cfg.initial_cash, date_strings)
         oos_summary = compute_summary([], oos_curve)
+        # Per-symbol summary is empty when no trades are present
+        oos_summary["per_symbol"] = compute_per_symbol_summary([], base_cfg.initial_cash, date_strings)
         oos_summary["regime_breakdown"] = compute_regime_breakdown([])
     # Handle holdout if configured
     if holdout_start_idx is not None:
@@ -400,10 +441,13 @@ def run_walkforward(
         # Determine holdout dates
         h_start = day_list[h_start_idx]
         h_end = day_list[h_end_idx]
-        # Select best params using all data before holdout
+        # Select best params using all data before the holdout period
         if h_start_idx > 0:
+            # In-sample period spans from the beginning of available trading days
+            # up to the day immediately preceding the holdout start.
             in_sample_start = day_list[0]
             in_sample_end = day_list[h_start_idx - 1]
+            # Run a parameter sweep over the in-sample window to select best params
             _, best_info, _ = run_parameter_sweep(
                 bars_map,
                 base_cfg,
@@ -412,9 +456,11 @@ def run_walkforward(
                 start_date=in_sample_start,
                 end_date=in_sample_end,
                 top_n=0,
+                cost_model=cost_model,
             )
             best_params_holdout = best_info.get("params", {})
         else:
+            # No prior data before holdout; fall back to default/empty params
             best_params_holdout = {}
         # Run backtest on holdout period
         holdout_result, holdout_metrics = run_backtest_for_params(
@@ -423,21 +469,26 @@ def run_walkforward(
             best_params_holdout,
             start_date=h_start,
             end_date=h_end,
+            cost_model=cost_model,
         )
         holdout_trades = holdout_result.trades
         # Build curve for holdout
         if holdout_trades:
-            from .metrics import equity_curve
+            from .metrics import equity_curve, compute_per_symbol_summary
+            # Use only the holdout period's trading days for the per-symbol equity curve
             date_strings_h = [d.isoformat() for d in trading_days(h_start, h_end)]
             h_curve = equity_curve(holdout_trades, base_cfg.initial_cash, date_strings_h)
             holdout_summary = compute_summary(holdout_trades, h_curve)
+            holdout_summary["per_symbol"] = compute_per_symbol_summary(holdout_trades, base_cfg.initial_cash, date_strings_h)
             holdout_summary["regime_breakdown"] = compute_regime_breakdown(holdout_trades)
         else:
             # No holdout trades but holdout enabled: build curve over holdout period and compute summary
-            from .metrics import equity_curve
+            from .metrics import equity_curve, compute_per_symbol_summary
             date_strings_h = [d.isoformat() for d in trading_days(h_start, h_end)]
             h_curve = equity_curve([], base_cfg.initial_cash, date_strings_h)
             holdout_summary = compute_summary([], h_curve)
+            # Per-symbol summary is empty when no holdout trades exist
+            holdout_summary["per_symbol"] = compute_per_symbol_summary([], base_cfg.initial_cash, date_strings_h)
             holdout_summary["regime_breakdown"] = compute_regime_breakdown([])
     return {
         "folds": fold_rows,

@@ -25,8 +25,64 @@ from typing import List, Optional, Dict, Any
 from zoneinfo import ZoneInfo
 
 from ..config import CANONICAL_WHITELIST
-from ..features.indicators import compute_indicators
-from ..features.regimes import compute_regimes
+# Import indicator and regime modules rather than functions directly.  This
+# allows monkeypatching of either the module functions (e.g.,
+# informer.features.indicators.compute_indicators) or the wrapper
+# functions defined below.  The baseline strategy calls the wrapper
+# functions to resolve indicator computations at runtime.
+from ..features import indicators as _indicators
+from ..features import regimes as _regimes
+
+def compute_indicators(bars: List[Dict[str, Any]], timeframe: str) -> List[Dict[str, Any]]:
+    """Compute indicators via the informer.features.indicators module.
+
+    A thin wrapper around ``_indicators.compute_indicators``.  Wrapping
+    the call in this module allows tests to monkeypatch
+    ``informer.backtest.strategy.compute_indicators`` directly or to
+    monkeypatch the underlying function on ``informer.features.indicators``.
+
+    Parameters
+    ----------
+    bars : list of dict
+        The bar data to compute indicators on.
+    timeframe : str
+        The timeframe string (e.g., "15m", "1h").
+
+    Returns
+    -------
+    list of dict
+        Indicator values aligned one-to-one with the input bars.
+    """
+    return _indicators.compute_indicators(bars, timeframe)
+
+
+def compute_regimes(
+    bars: List[Dict[str, Any]],
+    indicators: List[Dict[str, Any]],
+    timeframe: str,
+) -> List[Dict[str, Any]]:
+    """Compute regimes via the informer.features.regimes module.
+
+    This wrapper simply forwards to
+    ``_regimes.compute_regimes``.  It allows tests to monkeypatch
+    regime computations on either ``informer.backtest.strategy.compute_regimes``
+    or the underlying implementation in ``informer.features.regimes``.
+
+    Parameters
+    ----------
+    bars : list of dict
+        Bar data used for regime computation.
+    indicators : list of dict
+        Corresponding indicator values.
+    timeframe : str
+        The timeframe string.
+
+    Returns
+    -------
+    list of dict
+        Regime labels aligned one-to-one with the input bars.
+    """
+    return _regimes.compute_regimes(bars, indicators, timeframe)
 from .splits import aggregate_bars
 
 

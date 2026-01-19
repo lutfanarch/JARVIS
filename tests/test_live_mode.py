@@ -2,11 +2,12 @@
 
 These tests verify that when the environment is configured for live
 LLM mode but required API keys are missing, the decide command
-produces a deterministic no‑trade decision rather than falling back to
-the fake client.  The decision should contain reason codes
-``LIVE_MODE_INIT_FAILED`` and ``MISSING_API_KEYS`` and include the
-initialisation error in the audit field.  No live network calls are
-attempted.
+performs a deterministic preflight check and fails closed with a
+``NOT_READY`` decision.  No pipeline or client initialisation
+occurs, and the CLI exits with a non‑zero status.  The decision
+should include a ``MISSING_API_KEYS`` reason code and list the
+missing variables in its audit field.  No live network calls are
+attempted and no stack trace is emitted.
 """
 
 from __future__ import annotations
@@ -21,16 +22,21 @@ from informer.cli import cli
 
 
 def test_decide_live_mode_missing_keys(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    """When LLM_MODE=live and API keys are missing, decide should yield a no‑trade decision."""
+    """When LLM_MODE=live and required API keys are missing, decide should fail closed with NOT_READY."""
     # Ensure live mode is requested
     monkeypatch.setenv("LLM_MODE", "live")
-    # Unset any API keys to simulate missing credentials
-    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
-    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
-    monkeypatch.delenv("GOOGLE_API_KEY", raising=False)
+    # Clear all API keys to simulate missing credentials
+    for var in [
+        "ALPACA_API_KEY_ID",
+        "ALPACA_API_SECRET_KEY",
+        "OPENAI_API_KEY",
+        "GEMINI_API_KEY",
+        "GOOGLE_API_KEY",
+    ]:
+        monkeypatch.delenv(var, raising=False)
     # Restrict symbols to a single allowed symbol to simplify packet loading
     monkeypatch.setenv("SYMBOLS", "AAPL")
-    # Create empty packets directory (no packets required since init failure short‑circuits pipeline)
+    # Create empty packets directory (no packets required since preflight skips pipeline)
     packets_dir = tmp_path / "packets"
     packets_dir.mkdir(parents=True, exist_ok=True)
     # Output directory for decision
@@ -55,18 +61,32 @@ def test_decide_live_mode_missing_keys(monkeypatch: pytest.MonkeyPatch, tmp_path
             "50",
         ],
     )
-    assert result.exit_code == 0, result.output
+    # The preflight should exit with code 2 (non‑zero)
+    assert result.exit_code == 2, result.output
+    # Ensure no traceback is printed
+    assert "Traceback" not in result.output, "Unexpected traceback in output"
     # Decision file should exist
     decision_file = decisions_dir / "test_run.json"
     assert decision_file.exists(), f"Decision file not found: {decision_file}"
     with decision_file.open("r", encoding="utf-8") as f:
         decision = json.load(f)
-    # Expect a no‑trade decision
-    assert decision.get("action") == "NO_TRADE"
-    # Reason codes should include our live mode failure codes
+    # Expect a NOT_READY decision
+    assert decision.get("action") == "NOT_READY"
+    # Reason codes should include MISSING_API_KEYS
     rcodes = decision.get("reason_codes", [])
-    assert "LIVE_MODE_INIT_FAILED" in rcodes
     assert "MISSING_API_KEYS" in rcodes
-    # Audit should include the init error
+    # Audit should include missing_env_vars list
     audit = decision.get("audit", {})
-    assert "live_init_error" in audit
+    assert "missing_env_vars" in audit
+    missing = audit.get("missing_env_vars")
+    # Should include all required variables (Gemini key stands for either Gemini or Google)
+    # The missing variables list returned by the implementation should already be
+    # sorted lexicographically.  Define the expected order explicitly and
+    # compare directly.
+    expected_missing = [
+        "ALPACA_API_KEY_ID",
+        "ALPACA_API_SECRET_KEY",
+        "GEMINI_API_KEY",
+        "OPENAI_API_KEY",
+    ]
+    assert missing == expected_missing

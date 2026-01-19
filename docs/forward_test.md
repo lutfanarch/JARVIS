@@ -11,15 +11,18 @@ hindsight.
 
 ## Enabling Shadow Mode
 
-Set the environment variable `JARVIS_RUN_MODE` to `shadow` when
-invoking the daily scan script.  For example:
+To run a forward‑test (shadow) scan you no longer need Bash or a
+shell script.  Instead use the Windows‑friendly `jarvis` CLI with the
+`daily-scan` command and specify `--run-mode shadow`.  For example,
+from a PowerShell prompt:
 
-```sh
-JARVIS_RUN_MODE=shadow ./scripts/daily_scan.sh
+```powershell
+jarvis daily-scan --run-mode shadow
 ```
 
-In shadow mode the final decision file is still written to
-`artifacts/decisions/<run_id>.json` and a comprehensive set of
+This executes the entire daily scan pipeline deterministically
+without sending live trade alerts.  The final decision file is written
+to `artifacts/decisions/<run_id>.json`, and a comprehensive set of
 artefacts is saved under `artifacts/forward_test/<ny_date>/<run_id>/`.
 These artefacts include the run configuration, the packets fed into
 the LLM pipeline, the decision, a validator report and the lock
@@ -28,19 +31,23 @@ status.  A summary entry is also appended to
 
 ## Forward‑Test CLI
 
-The `forwardtest` command group exposes utilities for inspecting and
-reporting on recorded runs:
+The `forwardtest` command group under the `jarvis` CLI exposes
+utilities for inspecting and reporting on recorded runs:
 
-- `informer forwardtest record --run-id <id> --as-of <timestamp>`
+- `jarvis forwardtest record --run-id <id> --as-of <timestamp>`
   records a completed shadow run.  This is normally invoked by
-  `scripts/daily_scan.sh` when `JARVIS_RUN_MODE=shadow`.
-- `informer forwardtest list --start <YYYY-MM-DD> --end <YYYY-MM-DD>`
-  lists runs by New York trade date, showing the decision status and
+  `jarvis daily-scan --run-mode shadow` when recording forward‑test runs.
+- `jarvis forwardtest list --start <YYYY-MM-DD> --end <YYYY-MM-DD>`
+  lists runs by New York trade date, showing the decision status and
   selected symbol.
-- `informer forwardtest report --start <YYYY-MM-DD> --end <YYYY-MM-DD> --out <path>`
+- `jarvis forwardtest report --start <YYYY-MM-DD> --end <YYYY-MM-DD> --out <path>`
   writes a JSON report summarising counts by status and symbol.
-- `informer forwardtest log-outcome --ny-date <YYYY-MM-DD> --symbol <SYM> --entry <price> --exit <price> [--notes <text>]`
-  appends a realised trade outcome to the forward test outcomes
-  registry.
+  You may either specify `--run-id <RUN_ID>` to look up
+  the trade date and symbol from the recorded forward‑test run, or
+  provide `--ny-date` and `--symbol` explicitly.  Do not mix run‑id
+  with explicit date/symbol in the same invocation.  A realised
+  entry price is optional; if omitted, the entry from the decision
+  artefact will be used when computing realised PnL and R in the
+  report.
 
-See `informer forwardtest --help` for details.
+See `jarvis forwardtest --help` for details.

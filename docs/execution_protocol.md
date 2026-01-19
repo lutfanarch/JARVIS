@@ -17,7 +17,7 @@ consistent execution and risk control.
 
 3. **Record Trade** – Log the order details, including timestamp,
    price and order identifier.  For forward‑test runs use
-   `informer forwardtest log-outcome` once the trade is completed.
+   `jarvis forwardtest log-outcome` once the trade is completed.
 
 ## Management
 
@@ -34,7 +34,14 @@ consistent execution and risk control.
 
 ## Logging Outcomes
 
-Use the `forwardtest log-outcome` command to record realised entry
+Use the `jarvis forwardtest log-outcome` command to record realised entry
 and exit prices for forward‑tested trades.  This data contributes to
 post‑mortem analysis and strategy improvement.  Provide any
-observations or execution notes via the `--notes` option.
+observations or execution notes via the `--notes` option.  You may
+also specify `--duration-seconds` to log the time you held the
+position (in seconds).  Logging the duration enables the evaluation
+status command to distinguish **valid** profits—those that meet the
+minimum hold time and profit-per-share rules—from invalid or
+unknown profits.  When the duration is omitted, profitable
+outcomes are considered to have unknown validity and are excluded
+from the valid profit tally.

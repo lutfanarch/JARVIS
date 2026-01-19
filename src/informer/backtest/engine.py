@@ -27,7 +27,7 @@ from zoneinfo import ZoneInfo
 from ..config import CANONICAL_WHITELIST
 from .costs import CostModel
 from .strategy import BacktestConfig, Strategy, BaselineStrategy, Candidate
-from .splits import trading_days, bars_up_to, bars_after
+from .splits import trading_days, bars_up_to, bars_after, filter_rth_bars, required_warmup_bars
 from .metrics import Trade, equity_curve, compute_summary
 
 
@@ -74,12 +74,15 @@ class BacktestEngine:
         for sym in self.config.symbols:
             if sym not in bars:
                 raise ValueError(f"Missing bar data for symbol {sym}")
-        # Pre‑sort bars per symbol by timestamp
+        # Pre‑sort bars per symbol by timestamp and filter to Regular Trading Hours
         sorted_bars: Dict[str, List[Dict[str, Any]]] = {}
         for sym, b_list in bars.items():
-            sorted_bars[sym] = sorted(
+            # Remove bars without timestamps and sort ascending by ts
+            sorted_raw = sorted(
                 [b for b in b_list if b.get("ts")], key=lambda x: x["ts"]
             )
+            # Apply RTH filtering based on the decision timezone; maintain order
+            sorted_bars[sym] = filter_rth_bars(sorted_raw, self.config.decision_tz)
         # Determine list of trading days
         day_list = trading_days(self.config.start_date, self.config.end_date)
         # Prepare results
@@ -94,17 +97,31 @@ class BacktestEngine:
             local_dt = datetime.combine(d, self.config.decision_time)
             local_dt = local_dt.replace(tzinfo=local_tz)
             decision_ts = local_dt.astimezone(ZoneInfo("UTC"))
-            # Evaluate each symbol using strategy
+            # Evaluate each symbol using strategy, applying warmup gating
             candidates: List[Candidate] = []
+            warmup_insufficient = False
             for sym in self.config.symbols:
                 b15 = sorted_bars[sym]
+                # Determine the bars up to the decision timestamp (inclusive)
+                bars_before = bars_up_to(b15, decision_ts)
+                # Require a minimum number of bars to avoid look‑ahead bias
+                required = required_warmup_bars("15m")
+                if len(bars_before) < required:
+                    # Skip this symbol during warmup; mark that at least one symbol
+                    # lacked sufficient history.  We do not attempt to generate a
+                    # candidate for symbols without enough bars.
+                    warmup_insufficient = True
+                    continue
                 # Bars may contain multiple days; we rely on strategy to
                 # slice appropriately using decision_ts
                 cand = self.strategy.generate_candidate(sym, b15, decision_ts, self.config)
                 if cand is not None:
                     candidates.append(cand)
             if not candidates:
-                reasons.append({"date": d.isoformat(), "reason": "NO_VALID_CANDIDATE"})
+                # If any symbol was skipped due to insufficient warmup, record a
+                # specific reason; otherwise fall back to generic no‑candidate.
+                reason_code = "WARMUP_INSUFFICIENT_BARS" if warmup_insufficient else "NO_VALID_CANDIDATE"
+                reasons.append({"date": d.isoformat(), "reason": reason_code})
                 continue
             # Select best candidate by highest score; tie break by symbol order
             candidates.sort(key=lambda c: (-c.score, c.symbol))
@@ -220,8 +237,17 @@ class BacktestEngine:
                 trend_regime_1h=str(best.context.get("trend_regime_1h", "")),
             )
             trades.append(tr)
-        # Compute equity curve and summary metrics
+        # Compute equity curve and summary metrics.  The equity curve is
+        # built over all trading days in the requested date range.  Once
+        # the aggregate summary is computed, also compute a per‑symbol
+        # breakdown so that downstream consumers can analyze performance
+        # contributions from each symbol.  The per‑symbol breakdown
+        # reuses the same date_strings to ensure curves are aligned.
         date_strings = [d.isoformat() for d in day_list]
         curve = equity_curve(trades, self.config.initial_cash, date_strings)
         summary = compute_summary(trades, curve)
+        # Compute per‑symbol summary using only the trades for each symbol
+        from .metrics import compute_per_symbol_summary  # local import to avoid circular
+        per_symbol = compute_per_symbol_summary(trades, self.config.initial_cash, date_strings)
+        summary["per_symbol"] = per_symbol
         return BacktestResult(trades=trades, equity_curve=curve, summary=summary, reasons=reasons)

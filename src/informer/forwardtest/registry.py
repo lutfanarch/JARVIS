@@ -141,40 +141,125 @@ def append_outcome(
     *,
     ny_date: str,
     symbol: str,
-    entry: float,
     exit: float,
+    entry: Optional[float] = None,
     notes: Optional[str] = None,
+    duration_seconds: Optional[int] = None,
 ) -> Dict[str, Any]:
-    """Append a user-provided outcome to the registry.
+    """Append a user‑provided outcome to the registry.
 
-    When the user manually executes a forward-tested trade, they may
-    record the realised entry and exit prices via this function.  The
-    outcome is stored in a separate JSONL file named
-    ``forward_test_outcomes.jsonl`` in the same directory as the
-    registry.  Outcomes are append-only and keyed by ``ny_date`` and
-    ``symbol``.
+    When the user manually executes a forward‑tested trade, they may
+    record the realised exit price and optionally the realised entry price
+    and duration via this function.  The outcome is stored in a separate
+    JSONL file named ``forward_test_outcomes.jsonl`` in the same
+    directory as the registry.  Outcomes are append‑only and keyed by
+    ``ny_date`` and ``symbol``.
 
-    Args:
-        ny_date: The trade date in America/New_York (YYYY-MM-DD).
-        symbol: The traded symbol.
-        entry: Realised entry price.
-        exit: Realised exit price.
-        notes: Optional free-text notes.
+    Parameters
+    ----------
+    ny_date : str
+        The trade date in America/New_York (YYYY-MM-DD).
+    symbol : str
+        The traded symbol.
+    exit : float
+        Realised exit price.
+    entry : float, optional
+        Realised entry price.  If omitted or ``None``, the entry will be
+        taken from the decision artifact during report generation.
+    notes : str, optional
+        Optional free‑text notes.
+    duration_seconds : int, optional
+        Realised trade duration in seconds.  When provided, this is used
+        to evaluate whether the trade satisfies minimum hold time rules.
 
-    Returns:
+    Returns
+    -------
+    dict
         The outcome record that was appended.
     """
     path = Path("artifacts") / "forward_test" / "forward_test_outcomes.jsonl"
     path.parent.mkdir(parents=True, exist_ok=True)
-    record = {
+    record: Dict[str, Any] = {
         "ny_date": ny_date,
         "symbol": symbol,
-        "entry": entry,
         "exit": exit,
         "notes": notes,
         "recorded_at_utc": datetime.utcnow().replace(microsecond=0).isoformat() + "Z",
     }
+    # Include entry only when provided (not None)
+    if entry is not None:
+        record["entry"] = entry
+    # Include duration when provided
+    if duration_seconds is not None:
+        try:
+            record["duration_seconds"] = int(duration_seconds)
+        except Exception:
+            # If conversion fails, omit duration to maintain backward compatibility
+            pass
     with path.open("a", encoding="utf-8") as f:
         json.dump(record, f, ensure_ascii=False, sort_keys=True)
         f.write("\n")
     return record
+
+
+def _outcomes_path() -> Path:
+    """Return the path to the forward test outcomes JSONL file.
+
+    The outcomes file is stored at ``artifacts/forward_test/forward_test_outcomes.jsonl``.
+    Parent directories are created if they do not exist when appending.
+    """
+    p = Path("artifacts") / "forward_test" / "forward_test_outcomes.jsonl"
+    return p
+
+
+def load_outcomes() -> List[Dict[str, Any]]:
+    """Load all recorded forward test outcomes from the JSONL log.
+
+    Each outcome record contains at least ``ny_date``, ``symbol`` and
+    ``exit``.  A realised ``entry`` is optional.  Notes and timestamps are
+    also optional.  If the file does not exist, an empty
+    list is returned.  Malformed lines are skipped.  The results are
+    sorted deterministically by (ny_date, symbol, recorded_at_utc) to
+    ensure stable report ordering.
+
+    Returns
+    -------
+    list of dict
+        Parsed outcome records.
+    """
+    path = _outcomes_path()
+    if not path.exists():
+        return []
+    outcomes: List[Dict[str, Any]] = []
+    try:
+        with path.open("r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    data = json.loads(line)
+                    # minimal required keys: ny_date, symbol and exit
+                    if not isinstance(data, dict):
+                        continue
+                    # Require ny_date and symbol
+                    if not all(k in data for k in ("ny_date", "symbol")):
+                        continue
+                    # Require exit price; entry may be missing
+                    if "exit" not in data:
+                        continue
+                    outcomes.append(data)
+                except Exception:
+                    # skip malformed lines
+                    continue
+    except Exception:
+        return []
+    # sort by ny_date, symbol, recorded_at_utc (if present)
+    def _sort_key(rec: Dict[str, Any]):
+        return (
+            rec.get("ny_date", ""),
+            rec.get("symbol", ""),
+            rec.get("recorded_at_utc", ""),
+        )
+    outcomes.sort(key=_sort_key)
+    return outcomes

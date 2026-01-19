@@ -148,7 +148,7 @@ def run_daily_scan(
     # Fast-path: detect missing Alpaca credentials for shadow mode.  When
     # running in shadow mode without credentials there is no point
     # executing ingest or downstream steps because they will fail.
-    missing_keys = not os.environ.get("ALPACA_API_KEY_ID") or not os.environ.get("ALPACA_API_SECRET_KEY")
+    missing_alpaca_keys = not os.environ.get("ALPACA_API_KEY_ID") or not os.environ.get("ALPACA_API_SECRET_KEY")
 
     # Determine whether to short-circuit the pipeline for offline shadow mode.
     # Only perform the fast-path skip when no custom runner has been supplied
@@ -157,7 +157,41 @@ def run_daily_scan(
     # inspect the list of attempted commands.  The variable is computed
     # outside the try/finally so that the finalizer can use it to decide
     # whether to invoke notification/forwardtest steps.
-    use_offline_fast_path = (runner is None) and (run_mode_normalised == "shadow") and missing_keys
+    use_offline_fast_path = (runner is None) and (run_mode_normalised == "shadow") and missing_alpaca_keys
+
+    # Live-mode preflight: determine if required live keys are missing.  In
+    # live mode the orchestrator must fail closed deterministically before
+    # attempting any provider initialisation or network-facing work.  The
+    # required keys mirror the config-check live requirements: Alpaca keys,
+    # OpenAI key and either Gemini or Google API key.  Missing variable
+    # names are accumulated into a list which is sorted for deterministic
+    # output.  When any are absent the pipeline is skipped and a NOT_READY
+    # decision emitted.
+    missing_live_vars: list[str] = []
+    if run_mode_normalised == "live":
+        # Alpaca API keys
+        if not os.environ.get("ALPACA_API_KEY_ID"):
+            missing_live_vars.append("ALPACA_API_KEY_ID")
+        if not os.environ.get("ALPACA_API_SECRET_KEY"):
+            missing_live_vars.append("ALPACA_API_SECRET_KEY")
+        # OpenAI key
+        if not os.environ.get("OPENAI_API_KEY"):
+            missing_live_vars.append("OPENAI_API_KEY")
+        # Gemini can be satisfied by GEMINI_API_KEY or GOOGLE_API_KEY
+        if not (os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")):
+            missing_live_vars.append("GEMINI_API_KEY")
+        missing_live_vars.sort()
+    # Preflight gating applies when run_mode is live and at least one
+    # required variable is missing.  Unlike the offline fast-path this
+    # applies regardless of whether a custom runner has been provided: the
+    # orchestrator must never attempt to initialise providers in live mode
+    # when credentials are absent.
+    # The live preflight is only applied when no custom runner has been supplied (runner is None).
+    # This mirrors the offline fast-path behaviour: in unit tests a custom runner is often
+    # injected to record the sequence of commands executed, so preflight would inhibit
+    # those tests.  When run in real CLI usage (runner is None) missing keys cause an
+    # immediate skip before any pipeline steps are executed.
+    use_live_preflight = bool(missing_live_vars) and (run_mode_normalised == "live") and (runner is None)
 
     # Initialise run record metadata
     start_time = datetime.utcnow().replace(tzinfo=timezone.utc)
@@ -194,8 +228,30 @@ def run_daily_scan(
     # Wrap the main orchestration in a try/finally to guarantee the
     # decision file and run record are written and final steps are attempted
     try:
-        if use_offline_fast_path:
-            # Skip pipeline steps and write placeholder decision
+        if use_live_preflight:
+            # Live mode with missing credentials: fail closed without
+            # executing any pipeline steps.  Emit a short message listing
+            # missing variables and immediately write a placeholder decision.
+            missing_str = ", ".join(missing_live_vars)
+            print(
+                f"[JARVIS] Live mode with missing credentials; skipping pipeline and emitting NOT_READY decision. Missing: {missing_str}",
+                file=sys.stderr,
+            )
+            _write_placeholder_decision()
+            # Record all pipeline steps as SKIP deterministically
+            for step_name in [
+                "healthcheck",
+                "ingest",
+                "actions",
+                "qa",
+                "features",
+                "charts",
+                "packet",
+                "decide",
+            ]:
+                record_step(step_name, "SKIP")
+        elif use_offline_fast_path:
+            # Skip pipeline steps and write placeholder decision for shadow mode
             print(
                 "[JARVIS] Shadow mode with missing Alpaca credentials; skipping pipeline and emitting NOT_READY decision",
                 file=sys.stderr,
@@ -237,8 +293,10 @@ def run_daily_scan(
         # Ensure the decision artefact exists
         if not os.path.exists(decision_file_path):
             _write_placeholder_decision()
-        # In live mode, attempt notification (nonfatal) unless offline fast path
-        if run_mode_normalised == "live" and not use_offline_fast_path:
+        # In live mode, attempt notification (nonfatal) unless either offline fast path or
+        # live preflight has been triggered.  When live preflight is active the pipeline
+        # was skipped entirely and notification must not be attempted.
+        if run_mode_normalised == "live" and not use_offline_fast_path and not use_live_preflight:
             t0 = time.monotonic()
             rc_notify = run_cmd(["notify", "--decision-file", decision_file_path])
             dur_notify = time.monotonic() - t0
@@ -248,13 +306,13 @@ def run_daily_scan(
                 # Record failure and include return code in short_error
                 record_step("notify", "FAIL", dur_notify, rc_notify, f"exit code {rc_notify}")
                 print("[JARVIS] Notification step failed", file=sys.stderr)
-        elif run_mode_normalised == "live" and use_offline_fast_path:
-            # When offline fast path is taken in live mode (should not happen since only in shadow), mark notify as SKIP
-            record_step("notify", "SKIP")
         else:
-            # Non-live modes: notification is suppressed
+            # For non-live modes or when the pipeline was skipped (offline fast path or live
+            # preflight), mark notification as skipped.  In shadow mode we suppress
+            # notification but log a message to stderr for visibility (unless in offline
+            # fast path where network keys are missing).
             record_step("notify", "SKIP")
-            if not use_offline_fast_path:
+            if run_mode_normalised != "live" and not use_offline_fast_path and not use_live_preflight:
                 print(f"[JARVIS] Notification suppressed for run mode {run_mode_normalised}", file=sys.stderr)
         # In shadow mode, always run forward-test recording
         if run_mode_normalised == "shadow":
@@ -316,3 +374,11 @@ def run_daily_scan(
                 json.dump(run_record, f)
         except Exception as exc:
             print(f"[JARVIS] Failed to write run record: {exc}", file=sys.stderr)
+
+        # If live preflight was triggered, exit with a deterministic non-zero code after
+        # finalisation has completed.  Using sys.exit here ensures that the CLI
+        # propagates the exit status while still having written the decision and
+        # run artefacts.  This call will raise SystemExit and stop further
+        # execution of run_daily_scan.
+        if use_live_preflight:
+            sys.exit(2)

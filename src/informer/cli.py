@@ -52,6 +52,7 @@ from .backtest.io import (
     write_reasons_csv,
     write_summary_json,
 )
+from .backtest.costs import CostModel
 
 # Phase 3 validation helpers
 from .backtest.validation import run_parameter_sweep, run_walkforward
@@ -59,6 +60,273 @@ from .config import UNIVERSE_VERSION
 
 # Forward test CLI group import
 from .forwardtest.cli import forwardtest
+# Import the prop CLI group for prop‑firm evaluation status.  The
+# group is registered near the bottom of this module via
+# cli.add_command.
+from .props.cli import prop
+
+import subprocess
+import sys
+from datetime import datetime, timezone
+import json as _json
+import shutil
+
+@click.command(name="verify-dod-b", help="Verify the Definition of Done (DoD‑B) checklist and write a report.")
+@click.option(
+    "--run-id",
+    default="shipit",
+    help="Identifier used for naming the verification report (defaults to 'shipit').",
+)
+@click.option(
+    "--skip-pytest",
+    is_flag=True,
+    default=False,
+    help="Skip running the pytest suite during verification.",
+)
+def verify_dod_b(run_id: str, skip_pytest: bool) -> None:
+    """Run the Definition of Done (DoD‑B) checklist and write a report.
+
+    This command performs a series of deterministic checks to verify that
+    the repository is ready for final delivery.  It always writes a
+    JSON report under ``artifacts/shipit/<run-id>.json`` detailing the
+    results of each step along with any captured output.  If any
+    required step fails the command exits with status 2; otherwise it
+    exits with status 0.  The optional ``--skip-pytest`` flag can be
+    used to bypass the test suite for faster iterations.
+
+    Parameters
+    ----------
+    run_id : str
+        Unique identifier appended to generated artifact names.
+    skip_pytest : bool
+        When True, the pytest step is skipped and marked as passed.
+    """
+    # Record the start time in UTC ISO format
+    started_at = datetime.utcnow().replace(tzinfo=timezone.utc).isoformat()
+    steps: list[dict[str, object]] = []
+    overall_pass = True
+    # Helper to run a subprocess step and collect output
+    def _run_subprocess(cmd: list[str], env: dict[str, str]) -> tuple[int, str, str]:
+        """Run a subprocess capturing stdout and stderr.
+
+        Returns a tuple of (exit_code, stdout_tail, stderr_tail).  The
+        output tails are truncated to the last 20 lines to keep the
+        report manageable and deterministic.
+        """
+        try:
+            completed = subprocess.run(
+                cmd,
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=300,
+            )
+            stdout_lines = completed.stdout.splitlines()
+            stderr_lines = completed.stderr.splitlines()
+            stdout_tail = "\n".join(stdout_lines[-20:])
+            stderr_tail = "\n".join(stderr_lines[-20:])
+            return completed.returncode, stdout_tail, stderr_tail
+        except Exception as exc:
+            # If the subprocess cannot be executed, capture the exception
+            return 1, "", f"Exception: {exc}"
+
+    # Step A: repository sanity
+    # Determine whether the current working directory appears to be a valid repository.
+    repo_ok = Path("pyproject.toml").exists() and Path("src").is_dir() and Path("tests").is_dir()
+    # Always record the repo_sanity step in the report.  It passes only if all
+    # required files/directories exist in the current working directory.
+    steps.append(
+        {
+            "name": "repo_sanity",
+            "pass": bool(repo_ok),
+            "exit_code": 0 if repo_ok else 1,
+            "notes": "Verify pyproject.toml, src/ and tests/ exist in current directory",
+            "stdout_tail": "",
+            "stderr_tail": "",
+        }
+    )
+    # If the repository sanity check fails, immediately write the report and exit.
+    if not repo_ok:
+        overall_pass = False
+        # Record finish time for the report
+        finished_at = datetime.utcnow().replace(tzinfo=timezone.utc).isoformat()
+        report = {
+            "overall_pass": bool(overall_pass),
+            "started_at_utc": started_at,
+            "finished_at_utc": finished_at,
+            "steps": steps,
+        }
+        # Ensure the shipit directory exists
+        shipit_dir = Path("artifacts") / "shipit"
+        shipit_dir.mkdir(parents=True, exist_ok=True)
+        report_path = shipit_dir / f"{run_id}.json"
+        try:
+            with report_path.open("w", encoding="utf-8") as f:
+                _json.dump(report, f, indent=2, sort_keys=True)
+        except Exception:
+            # Print an error if report writing fails; continue to exit
+            click.echo(f"[error] Failed to write report to {report_path}", err=True)
+        # Exit immediately with status 2 indicating failure.  No further
+        # verification steps are executed when the repository is missing.
+        sys.exit(2)
+
+    # Prepare base environment: ensure PYTHONPATH points to the src directory
+    base_env = os.environ.copy()
+    # Always prepend/replace PYTHONPATH with a relative src path for deterministic import resolution
+    base_env["PYTHONPATH"] = "src"
+
+    # Step B: run test suite unless skipped
+    if skip_pytest:
+        steps.append(
+            {
+                "name": "pytest",
+                "pass": True,
+                "exit_code": 0,
+                "notes": "Skipped pytest via --skip-pytest",
+                "stdout_tail": "",
+                "stderr_tail": "",
+            }
+        )
+    else:
+        exit_code, stdout_tail, stderr_tail = _run_subprocess(
+            [sys.executable, "-m", "pytest", "-q"], base_env
+        )
+        passed = exit_code == 0
+        steps.append(
+            {
+                "name": "pytest",
+                "pass": bool(passed),
+                "exit_code": exit_code,
+                "notes": "Run test suite via pytest -q",
+                "stdout_tail": stdout_tail,
+                "stderr_tail": stderr_tail,
+            }
+        )
+        if not passed:
+            overall_pass = False
+
+    # Step C: CLI smoke steps
+    # Helper to run a CLI command and determine pass/fail based on exit code expectations
+    def _cli_step(
+        step_name: str,
+        args: list[str],
+        env_overrides: dict[str, str] | None = None,
+        expect_zero: bool = True,
+        extra_check: callable | None = None,
+    ) -> None:
+        nonlocal overall_pass
+        env = base_env.copy()
+        if env_overrides:
+            env.update(env_overrides)
+        # Invoke the CLI via ``python -m informer`` rather than ``informer.cli``.
+        cmd = [sys.executable, "-m", "informer"] + args
+        exit_code, stdout_tail, stderr_tail = _run_subprocess(cmd, env)
+        # Determine pass according to expectation
+        step_pass = (exit_code == 0) if expect_zero else (exit_code != 0)
+        notes = ""
+        # If there is an extra validation callable, invoke it and combine its result
+        if extra_check is not None:
+            try:
+                extra_ok = extra_check()
+            except Exception:
+                extra_ok = False
+            if not extra_ok:
+                step_pass = False
+        steps.append(
+            {
+                "name": step_name,
+                "pass": bool(step_pass),
+                "exit_code": exit_code,
+                "notes": notes,
+                "stdout_tail": stdout_tail,
+                "stderr_tail": stderr_tail,
+            }
+        )
+        if not step_pass:
+            overall_pass = False
+
+    # CLI: jarvis --help
+    _cli_step("cli_help", ["--help"], expect_zero=True)
+    # jarvis db-init with DATABASE_URL set
+    _cli_step(
+        "db_init",
+        ["db-init"],
+        env_overrides={"DATABASE_URL": "sqlite:///./jarvis.db"},
+        expect_zero=True,
+    )
+    # jarvis smoke-test
+    _cli_step(
+        "smoke_test",
+        ["smoke-test", "--db-path", "./jarvis_smoke.db", "--run-id", f"{run_id}_smoke", "--keep"],
+        expect_zero=True,
+    )
+    # jarvis config-check shadow: should succeed
+    _cli_step(
+        "config_check_shadow",
+        ["config-check", "--mode", "shadow"],
+        expect_zero=True,
+    )
+    # jarvis config-check live: should return non-zero (missing env vars)
+    _cli_step(
+        "config_check_live",
+        ["config-check", "--mode", "live"],
+        expect_zero=False,
+    )
+    # Prepare for daily-scan: remove artifacts directory to ensure a fresh run
+    try:
+        shutil.rmtree("artifacts")
+    except Exception:
+        pass
+    # Extra check after daily-scan: verify artifact files exist and registry contains run-id
+    def _daily_scan_extra_check() -> bool:
+        decisions_path = Path("artifacts") / "decisions" / f"{run_id}_daily.json"
+        runs_path = Path("artifacts") / "runs" / f"{run_id}_daily.json"
+        fwd_path = Path("artifacts") / "forward_test" / "forward_test_runs.jsonl"
+        if not (decisions_path.exists() and runs_path.exists() and fwd_path.exists()):
+            return False
+        # Verify run-id appears in the forward-test runs file
+        try:
+            content = fwd_path.read_text(encoding="utf-8")
+            return f"{run_id}_daily" in content
+        except Exception:
+            return False
+
+    _cli_step(
+        "daily_scan",
+        [
+            "daily-scan",
+            "--run-id",
+            f"{run_id}_daily",
+            "--run-mode",
+            "shadow",
+        ],
+        env_overrides={"DATABASE_URL": "sqlite:///./jarvis.db"},
+        expect_zero=True,
+        extra_check=_daily_scan_extra_check,
+    )
+    # Record finish time and write report
+    finished_at = datetime.utcnow().replace(tzinfo=timezone.utc).isoformat()
+    report = {
+        "overall_pass": bool(overall_pass),
+        "started_at_utc": started_at,
+        "finished_at_utc": finished_at,
+        "steps": steps,
+    }
+    # Ensure report directory exists
+    shipit_dir = Path("artifacts") / "shipit"
+    shipit_dir.mkdir(parents=True, exist_ok=True)
+    report_path = shipit_dir / f"{run_id}.json"
+    try:
+        with report_path.open("w", encoding="utf-8") as f:
+            _json.dump(report, f, indent=2, sort_keys=True)
+    except Exception:
+        # If writing the report fails, attempt to print to stderr
+        click.echo(f"[error] Failed to write report to {report_path}", err=True)
+    # Exit with 0 if all passed, else 2
+    if overall_pass:
+        sys.exit(0)
+    else:
+        sys.exit(2)
 
 # -----------------------------------------------------------------------------
 
@@ -87,6 +355,71 @@ def _previous_weekday(d: date) -> date:
     while prev_day.weekday() >= 5:
         prev_day = prev_day - timedelta(days=1)
     return prev_day
+
+
+def _compute_warmup_start_date(start_date: date, timeframe: str = "15m") -> date:
+    """Compute the earliest trading day to load for warmup history.
+
+    Backtests rely on a minimum number of bars (``required_warmup_bars``)
+    before a trade may be taken.  For intraday 15‑minute bars during
+    Regular Trading Hours there are 26 bars per trading day.  To ensure
+    that the warmup threshold is satisfied even when the first trading
+    day in the requested range has only a handful of bars before the
+    decision time, this helper adds a small safety margin to the
+    computed lookback.  The number of trading days to load is given by
+
+    ``ceil(required_warmup_bars / 26) + 2``
+
+    The ``+2`` accounts for days with partial data (e.g., when the
+    decision time is early in the session) and ensures determinism across
+    backtests.  The helper then walks backwards from the user‑specified
+    start date, counting only weekdays (Monday through Friday), until
+    the required number of prior trading days have been collected.  The
+    resulting date is returned.  If the database does not contain
+    enough history before this date, warmup gating will still block
+    trading on the first days of the backtest and record an appropriate
+    reason.
+
+    Parameters
+    ----------
+    start_date : date
+        The first requested trading day for the backtest (the day the
+        user wants metrics/trades to begin).
+    timeframe : str, optional
+        The bar timeframe.  Only "15m" is currently used for intraday
+        warmup.  Other timeframes will fall back to the same default
+        warmup bars count.
+
+    Returns
+    -------
+    date
+        A date preceding ``start_date`` by a deterministic number of
+        trading days.  Bars from this date onward should be loaded to
+        satisfy indicator warmup; bars prior to this date are not
+        required.
+    """
+    # Import here to avoid circular dependency at module load time
+    from .backtest.splits import required_warmup_bars
+    warmup_bars = required_warmup_bars(timeframe)
+    # For 15m bars during Regular Trading Hours there are 26 bars per day
+    bars_per_day = 26
+    # Determine how many trading days of history are needed.  Use a
+    # ceiling division for warmup bars and add a safety buffer of two
+    # additional trading days to account for partial sessions.  This
+    # ensures that even on a day with few bars before the decision time
+    # there will still be >= required_warmup_bars bars available.
+    from math import ceil
+    trading_days_needed = ceil(warmup_bars / bars_per_day) + 2
+    # Walk backwards across calendar days, counting only weekdays
+    from datetime import timedelta
+    d = start_date
+    count = 0
+    while count < trading_days_needed:
+        d = d - timedelta(days=1)
+        # Monday=0, Sunday=6; only count weekdays as trading days
+        if d.weekday() < 5:
+            count += 1
+    return d
 
 
 def _parse_datetime(value: Optional[str]) -> Optional[datetime]:
@@ -1394,10 +1727,86 @@ def decide(
                 cash_usd = None
     # Determine trade lock path: under artifacts/state/trade_lock.json relative to out_path parent
     trade_lock_path = out_path.parent / "state" / "trade_lock.json"
-    # Load packets
-    packets = load_packets(packets_path, requested)
-    # Determine LLM mode: use live clients when LLM_MODE=live, else fake
+
+    # Determine LLM mode now so that we can perform live preflight before loading packets
     llm_mode = os.getenv("LLM_MODE", "fake").lower()
+
+    # Live-mode preflight: when running with LLM_MODE=live, verify that all required
+    # API keys are present before attempting to load packets or initialise any providers.
+    # The required keys mirror those checked by the config-check command: Alpaca keys,
+    # OpenAI key, and either Gemini or Google API key.  Missing variable names are
+    # accumulated into a list which is sorted for deterministic output.  When any are
+    # missing a NOT_READY decision is emitted and the CLI exits with status 2 without
+    # initialising any LLM clients or running the decision pipeline.
+    if llm_mode == "live":
+        missing_live_vars: list[str] = []
+        if not os.getenv("ALPACA_API_KEY_ID"):
+            missing_live_vars.append("ALPACA_API_KEY_ID")
+        if not os.getenv("ALPACA_API_SECRET_KEY"):
+            missing_live_vars.append("ALPACA_API_SECRET_KEY")
+        if not os.getenv("OPENAI_API_KEY"):
+            missing_live_vars.append("OPENAI_API_KEY")
+        if not (os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")):
+            missing_live_vars.append("GEMINI_API_KEY")
+        missing_live_vars.sort()
+        if missing_live_vars:
+            # Compose a NOT_READY decision with a MISSING_API_KEYS reason code
+            from informer.llm.models import ArbiterDecision
+            from informer.llm.validator import validate_and_size
+            arbiter_decision = ArbiterDecision(
+                action="NOT_READY",
+                symbol=None,
+                entry=None,
+                stop=None,
+                targets=[],
+                confidence=None,
+                reason_codes=["MISSING_API_KEYS"],
+                notes=None,
+            )
+            decision_not_ready = validate_and_size(
+                arbiter_decision,
+                as_of=as_of,
+                run_id=run_id,
+                whitelist=whitelist,
+                max_risk_usd=max_risk_val,
+                cash_usd=cash_usd,
+            )
+            # Attach audit details listing missing variables deterministically
+            try:
+                decision_not_ready.audit = {"missing_env_vars": missing_live_vars}
+            except Exception:
+                # Guard against unexpected issues assigning audit; ignore silently
+                pass
+            # Write the decision JSON to disk
+            decision_path = out_path / f"{run_id}.json"
+            with decision_path.open("w", encoding="utf-8") as f:
+                json.dump(decision_not_ready.model_dump(), f, indent=2, sort_keys=True, default=str)
+            # Print a concise error message listing the missing variables
+            click.echo(
+                "Missing environment variables: " + ", ".join(missing_live_vars),
+                err=True,
+            )
+            # Print summary line consistent with other decide outputs
+            sym_display = "-"
+            shares_display = "-"
+            risk_display = "-"
+            click.echo(
+                f"decide: action={decision_not_ready.action} symbol={sym_display} shares={shares_display} risk={risk_display} path={decision_path}"
+            )
+            # Emit JSON on stdout if requested
+            if json_output:
+                click.echo(
+                    json.dumps(
+                        decision_not_ready.model_dump(), indent=2, sort_keys=True, default=str
+                    )
+                )
+            # Exit with code 2 (consistent with config-check live failures)
+            ctx = click.get_current_context()
+            ctx.exit(2)
+
+    # At this point either live preflight passed or we are in fake mode; safe to load packets
+    packets = load_packets(packets_path, requested)
+
     decision: Optional[FinalDecision] = None  # type: ignore[assignment]
     llm: LLMClient
     if llm_mode == "live":
@@ -1636,6 +2045,15 @@ def notify(decision_file: str) -> None:
 # Register forwardtest CLI group
 cli.add_command(forwardtest, name="forwardtest")
 
+# Register prop CLI group (evaluation utilities)
+cli.add_command(prop, name="prop")
+
+# Register the verify‑dod‑b command after the CLI group is defined.  The
+# command itself is decorated with @click.command and must be added
+# explicitly to avoid a NameError when importing this module before
+# the cli group exists.
+cli.add_command(verify_dod_b)
+
 
 @cli.command()
 @click.option(
@@ -1683,6 +2101,20 @@ cli.add_command(forwardtest, name="forwardtest")
     default=None,
     help="Directory to write backtest artifacts (default: artifacts/backtests/<run_id>).",
 )
+@click.option(
+    "--slippage-bps",
+    type=float,
+    default=2.0,
+    show_default=True,
+    help="Slippage in basis points applied per side (default: 2.0).",
+)
+@click.option(
+    "--commission-per-share",
+    type=float,
+    default=0.0,
+    show_default=True,
+    help="Commission per share per side (default: 0.0).",
+)
 def backtest(
     start: str,
     end: str,
@@ -1691,6 +2123,8 @@ def backtest(
     decision_time: str,
     decision_tz: str,
     out_dir: Optional[str],
+    slippage_bps: float,
+    commission_per_share: float,
 ) -> None:
     """Run an intraday backtest over a date range.
 
@@ -1745,14 +2179,14 @@ def backtest(
     engine = _build_engine()
     from sqlalchemy import select, and_  # import locally to avoid global dependency
     from informer.ingestion.bars import bars_table  # import the table definition
-    # Determine start and end datetimes in UTC for bar retrieval.  Include a
-    # one-day buffer prior to start_date to provide enough history for
-    # indicator warm-up.  Bars outside the timeframe will be ignored by
-    # the engine when slicing.
-    # Convert start_date at 00:00 local to decision_tz then to UTC; subtract one day
+    # Determine start and end datetimes in UTC for bar retrieval.  Compute
+    # a warmup start date that looks back sufficiently far to satisfy
+    # the required warmup bars for 15m bars.  Bars outside the
+    # timeframe will be ignored by the engine when slicing.
     tzinfo = ZoneInfo(decision_tz)
-    start_dt_local = datetime.combine(start_date, _time(0, 0)).replace(tzinfo=tzinfo)
-    start_dt_utc = (start_dt_local - timedelta(days=1)).astimezone(ZoneInfo("UTC"))
+    warmup_date = _compute_warmup_start_date(start_date, "15m")
+    start_dt_local = datetime.combine(warmup_date, _time(0, 0)).replace(tzinfo=tzinfo)
+    start_dt_utc = start_dt_local.astimezone(ZoneInfo("UTC"))
     # Use the existing _time alias for consistency; the bare ``time`` is not imported
     # at this scope, so refer to `_time` for constructing 23:59 time
     end_dt_local = datetime.combine(end_date, _time(23, 59)).replace(tzinfo=tzinfo)
@@ -1795,14 +2229,16 @@ def backtest(
                 )
             bars_map[sym] = b_list
     # Run engine
-    engine_bt = BacktestEngine(config=cfg)
+    # Build cost model with user‑supplied parameters
+    cost_model = CostModel(slippage_bps=slippage_bps, commission_per_share=commission_per_share)
+    engine_bt = BacktestEngine(config=cfg, cost_model=cost_model)
     result = engine_bt.run(bars_map)
     # Write artifacts
     out_path.mkdir(parents=True, exist_ok=True)
     write_trades_csv(result.trades, str(out_path / "trades.csv"))
     write_equity_curve_csv(result.equity_curve, str(out_path / "equity_curve.csv"))
     write_reasons_csv(result.reasons, str(out_path / "reasons.csv"))
-    write_summary_json(result.summary, cfg, str(out_path / "summary.json"))
+    write_summary_json(result.summary, cfg, str(out_path / "summary.json"), cost_model=cost_model)
     click.echo(f"Backtest completed. Artifacts written to {out_path}")
 
 
@@ -1867,6 +2303,20 @@ def backtest(
     default="avg_r",
     help="Objective metric to maximize (avg_r, expectancy_r, total_pnl, profit_factor, win_rate, max_drawdown_pct)",
 )
+@click.option(
+    "--slippage-bps",
+    type=float,
+    default=2.0,
+    show_default=True,
+    help="Slippage in basis points applied per side (default: 2.0).",
+)
+@click.option(
+    "--commission-per-share",
+    type=float,
+    default=0.0,
+    show_default=True,
+    help="Commission per share per side (default: 0.0).",
+)
 def backtest_sweep(
     start: str,
     end: str,
@@ -1878,6 +2328,8 @@ def backtest_sweep(
     k_target_grid: str,
     score_threshold_grid: str,
     objective: str,
+    slippage_bps: float,
+    commission_per_share: float,
 ) -> None:
     """Run a parameter grid sweep over the specified date range.
 
@@ -1959,8 +2411,10 @@ def backtest_sweep(
     from sqlalchemy import select, and_  # deferred import for optional dependency
     from informer.ingestion.bars import bars_table
     tzinfo = ZoneInfo(decision_tz)
-    # Compute warmup start (previous weekday) so indicators have prior data
-    warmup_date = _previous_weekday(start_date)
+    # Compute warmup start date to load enough pre‑start history.  We
+    # look back across trading days according to the required warmup
+    # bars for 15m bars.
+    warmup_date = _compute_warmup_start_date(start_date, "15m")
     warmup_start_dt_local = datetime.combine(warmup_date, _time(0, 0)).replace(tzinfo=tzinfo)
     start_dt_utc = warmup_start_dt_local.astimezone(ZoneInfo("UTC"))
     end_dt_local = datetime.combine(end_date, _time(23, 59)).replace(tzinfo=tzinfo)
@@ -2001,8 +2455,9 @@ def backtest_sweep(
                     }
                 )
             bars_map[sym] = b_list
-    # Run parameter sweep.  top_n=0 returns all parameter combinations so
+    # Build cost model and run parameter sweep.  top_n=0 returns all parameter combinations so
     # that sweep_results.csv includes one row per param set.
+    cost_model = CostModel(slippage_bps=slippage_bps, commission_per_share=commission_per_share)
     sweep_results, best_info, best_result = run_parameter_sweep(
         bars_map,
         cfg,
@@ -2011,11 +2466,14 @@ def backtest_sweep(
         start_date=start_date,
         end_date=end_date,
         top_n=0,
+        cost_model=cost_model,
     )
     # Write sweep_results.csv.  Always write a header row based on the parameter
     # names and a stable set of metric keys.  If no results are present (which
     # should not occur when a non‑empty grid is provided), write only the
-    # header.
+    # header.  Sort results deterministically by parameter values (k_stop, k_target,
+    # score_threshold, extras) to ensure stable row ordering regardless of
+    # objective or dictionary ordering.
     import csv
     sweep_csv_path = out_path / "sweep_results.csv"
     param_keys = sorted(param_spec.keys())
@@ -2034,11 +2492,26 @@ def backtest_sweep(
             "profit_factor",
         ]
     header = param_keys + metric_keys
+    # Define a deterministic sort key for parameter ordering.  Use the same
+    # ordering rules as the tie‑break in run_parameter_sweep: sort by k_stop,
+    # k_target, score_threshold ascending, then by JSON of extras.
+    def _param_sort_key(entry: Dict[str, Any]) -> tuple:
+        p = entry["params"]
+        ks = p.get("k_stop")
+        kt = p.get("k_target")
+        st = p.get("score_threshold")
+        ks_val = float("inf") if ks is None else ks
+        kt_val = float("inf") if kt is None else kt
+        st_val = float("inf") if st is None else st
+        extras = {k: v for k, v in p.items() if k not in {"k_stop", "k_target", "score_threshold"}}
+        extras_str = json.dumps(extras, sort_keys=True)
+        return (ks_val, kt_val, st_val, extras_str)
+    sweep_results_sorted = sorted(sweep_results, key=_param_sort_key)
     with sweep_csv_path.open("w", newline="") as f:
         writer = csv.writer(f)
         writer.writerow(header)
-        for entry in sweep_results:
-            row = []
+        for entry in sweep_results_sorted:
+            row: List[Any] = []
             for k in param_keys:
                 row.append(entry["params"].get(k))
             m = entry["metrics"]
@@ -2046,13 +2519,23 @@ def backtest_sweep(
                 row.append(m.get(mk))
             writer.writerow(row)
     # Write best_params.json
+    # Persist the cost model assumptions alongside the best parameters and metrics so that
+    # sweep artifacts are self‑documenting.  Include the CLI‑provided cost settings
+    # regardless of whether defaults were used.  Keys are written in a deterministic
+    # order to preserve reproducibility of the file contents.
     best_params_path = out_path / "best_params.json"
     with best_params_path.open("w") as f:
+        # Assemble the cost_model block using the slippage and commission values passed
+        # via CLI.  These values originate from the constructed CostModel earlier.
         json.dump(
             {
                 "objective": objective,
                 "best_params": best_info.get("params", {}),
                 "best_metrics": best_info.get("metrics", {}),
+                "cost_model": {
+                    "slippage_bps": slippage_bps,
+                    "commission_per_share": commission_per_share,
+                },
             },
             f,
             indent=2,
@@ -2068,7 +2551,8 @@ def backtest_sweep(
         write_trades_csv(best_result.trades, str(best_dir / "trades.csv"))
         write_equity_curve_csv(best_result.equity_curve, str(best_dir / "equity_curve.csv"))
         write_reasons_csv(best_result.reasons, str(best_dir / "reasons.csv"))
-        write_summary_json(best_result.summary, best_cfg, str(best_dir / "summary.json"))
+        # Persist cost model assumptions in summary
+        write_summary_json(best_result.summary, best_cfg, str(best_dir / "summary.json"), cost_model=cost_model)
     click.echo(f"Parameter sweep completed. Artifacts written to {out_path}")
 
 
@@ -2163,6 +2647,20 @@ def backtest_sweep(
     default=None,
     help="Stride between fold starts (default: test-days)",
 )
+@click.option(
+    "--slippage-bps",
+    type=float,
+    default=2.0,
+    show_default=True,
+    help="Slippage in basis points applied per side (default: 2.0).",
+)
+@click.option(
+    "--commission-per-share",
+    type=float,
+    default=0.0,
+    show_default=True,
+    help="Commission per share per side (default: 0.0).",
+)
 def backtest_walkforward(
     start: str,
     end: str,
@@ -2179,6 +2677,8 @@ def backtest_walkforward(
     holdout_start: Optional[str],
     holdout_days: Optional[int],
     step_days: Optional[int],
+    slippage_bps: float,
+    commission_per_share: float,
 ) -> None:
     """Run a walk‑forward validation with optional holdout period.
 
@@ -2270,8 +2770,10 @@ def backtest_walkforward(
     from sqlalchemy import select, and_  # deferred import
     from informer.ingestion.bars import bars_table
     tzinfo = ZoneInfo(decision_tz)
-    # Compute warmup start (previous weekday) so indicators have prior data
-    warmup_date = _previous_weekday(start_date)
+    # Compute warmup start date to load enough pre‑start history.  We
+    # look back across trading days according to the required warmup
+    # bars for 15m bars.
+    warmup_date = _compute_warmup_start_date(start_date, "15m")
     warmup_start_dt_local = datetime.combine(warmup_date, _time(0, 0)).replace(tzinfo=tzinfo)
     start_dt_utc = warmup_start_dt_local.astimezone(ZoneInfo("UTC"))
     end_dt_local = datetime.combine(end_date, _time(23, 59)).replace(tzinfo=tzinfo)
@@ -2313,6 +2815,8 @@ def backtest_walkforward(
                 )
             bars_map[sym] = b_list
     # Run walkforward
+    # Build cost model for walk-forward runs
+    cost_model = CostModel(slippage_bps=slippage_bps, commission_per_share=commission_per_share)
     wf_result = run_walkforward(
         bars_map,
         cfg,
@@ -2325,6 +2829,7 @@ def backtest_walkforward(
         step_days=step_days,
         holdout_start=holdout_start_date,
         holdout_days=holdout_days,
+        cost_model=cost_model,
     )
     # Write walkforward_folds.csv
     import csv
@@ -2369,8 +2874,23 @@ def backtest_walkforward(
         # Compute default summary for zero trades
         oos_summary = compute_summary([], [])
         oos_summary["regime_breakdown"] = compute_regime_breakdown([])
+    # Persist cost model and versioning metadata in the OOS summary.  The summary
+    # dictionary contains aggregate metrics and a regime breakdown.  We augment
+    # this structure with a `meta` block that records the universe and
+    # validation versions as well as the cost model assumptions used.  Use
+    # dictionary unpacking to preserve existing keys while appending `meta` at
+    # the end for deterministic ordering.
+    oos_meta = {
+        "universe_version": UNIVERSE_VERSION,
+        "validation_version": "v1",
+        "cost_model": {
+            "slippage_bps": slippage_bps,
+            "commission_per_share": commission_per_share,
+        },
+    }
+    oos_summary_with_meta = {**oos_summary, "meta": oos_meta}
     with (out_path / "oos_summary.json").open("w") as f:
-        json.dump(oos_summary, f, indent=2)
+        json.dump(oos_summary_with_meta, f, indent=2)
     # Write holdout artifacts if holdout is enabled
     holdout_trades = wf_result.get("holdout_trades", [])
     holdout_summary = wf_result.get("holdout_summary")
@@ -2380,8 +2900,20 @@ def backtest_walkforward(
         if not holdout_summary:
             holdout_summary = compute_summary([], [])
             holdout_summary["regime_breakdown"] = compute_regime_breakdown([])
+        # Persist metadata in the holdout summary analogous to the OOS summary.  Record
+        # universe/version identifiers and the cost model.  Place meta at the end
+        # of the dictionary to maintain stable key ordering.
+        holdout_meta = {
+            "universe_version": UNIVERSE_VERSION,
+            "validation_version": "v1",
+            "cost_model": {
+                "slippage_bps": slippage_bps,
+                "commission_per_share": commission_per_share,
+            },
+        }
+        holdout_summary_with_meta = {**holdout_summary, "meta": holdout_meta}
         with (out_path / "holdout_summary.json").open("w") as f:
-            json.dump(holdout_summary, f, indent=2)
+            json.dump(holdout_summary_with_meta, f, indent=2)
     # Write run_config.json
     run_cfg = {
         "universe_version": UNIVERSE_VERSION,
@@ -2401,6 +2933,11 @@ def backtest_walkforward(
         run_cfg["holdout_start"] = holdout_start_date.isoformat()
     if holdout_days is not None:
         run_cfg["holdout_days"] = holdout_days
+    # Persist cost model assumptions for walk-forward
+    run_cfg["cost_model"] = {
+        "slippage_bps": slippage_bps,
+        "commission_per_share": commission_per_share,
+    }
     with (out_path / "run_config.json").open("w") as f:
         json.dump(run_cfg, f, indent=2)
     click.echo(f"Walk-forward validation completed. Artifacts written to {out_path}")

@@ -1,3 +1,7 @@
+
+# Pytest configuration: define custom markers.  The integration marker
+# identifies tests that require external services such as live
+# databases or network calls and may be skipped in offline runs.
 [build-system]
 requires = ["setuptools>=61.0", "wheel"]
 build-backend = "setuptools.build_meta"
