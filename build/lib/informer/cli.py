@@ -3015,7 +3015,6 @@ def backtest_walkforward(
         "cost_model": {
             "slippage_bps": slippage_bps,
             "commission_per_share": commission_per_share,
-            "slippage_per_share": slippage_per_share,
         },
     }
     oos_summary_with_meta = {**oos_summary, "meta": oos_meta}
@@ -3039,7 +3038,6 @@ def backtest_walkforward(
             "cost_model": {
                 "slippage_bps": slippage_bps,
                 "commission_per_share": commission_per_share,
-                "slippage_per_share": slippage_per_share,
             },
         }
         holdout_summary_with_meta = {**holdout_summary, "meta": holdout_meta}
@@ -3068,7 +3066,6 @@ def backtest_walkforward(
     run_cfg["cost_model"] = {
         "slippage_bps": slippage_bps,
         "commission_per_share": commission_per_share,
-        "slippage_per_share": slippage_per_share,
     }
     with (out_path / "run_config.json").open("w") as f:
         json.dump(run_cfg, f, indent=2)
