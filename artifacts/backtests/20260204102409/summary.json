@@ -1,0 +1,19 @@
+{
+  "universe_version": "universe_v2_2026-01-14",
+  "config": {
+    "symbols": [
+      "AAPL"
+    ],
+    "start_date": "2025-01-01",
+    "end_date": "2025-01-02",
+    "initial_cash": 100000.0,
+    "decision_time": "10:15",
+    "decision_tz": "America/New_York",
+    "k_stop": 1.5,
+    "k_target": 3.0,
+    "score_threshold": 0.0,
+    "risk_cap_pct": 0.005,
+    "risk_cap_fixed": 1000.0,
+    "extra_params": {},
+    "cost_model": {
+      "slippage_bps":

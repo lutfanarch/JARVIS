@@ -1,0 +1,3 @@
+[console_scripts]
+informer = informer.cli:cli
+jarvis = informer.cli:cli
